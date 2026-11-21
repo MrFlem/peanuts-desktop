@@ -20,3 +20,29 @@ HANDOFF*.md
 ONDEVICE*.md
 STUTTER-TEST*.md
 *.internal.md
+
+# Public-repository safety: never track user keys, firmware, game dumps or build packages.
+prod.keys
+title.keys
+*.keys
+/keys/
+/firmware/
+/secrets/
+*.nsp
+*.xci
+*.nsz
+*.xcz
+*.nup
+
+# Local credentials and environment configuration.
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_ed25519
+*.log
