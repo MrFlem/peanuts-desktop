@@ -1,193 +1,77 @@
-<h1 align="center">Peanuts Native</h1>
+# Peanuts Desktop
 
-<p align="center">
-  Nintendo Switch games running natively on Android dual-screen handhelds, with a live companion on the second screen.
-</p>
+**A desktop graphical interface for the Peanuts Native build workflow.**
 
-<p align="center">
-  <img alt="status" src="https://img.shields.io/badge/release-0.1.6-brightgreen"> <!-- PEANUTS -->
-  <img alt="license" src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue">
-  <img alt="platform" src="https://img.shields.io/badge/platform-Android%2013%2B-green">
-</p>
+This repository is being used to develop a more approachable desktop GUI for preparing Peanuts Native game builds. The goal is to make the existing command-line workflow easier to understand and use, especially for people who do not want to work directly with Python scripts, command-line arguments and terminal output.
 
-<div align="center">
-  <a href="https://discord.gg/r6vBWKAqCK"><img src="https://img.shields.io/badge/Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>&nbsp;<a href="https://ko-fi.com/igawa6"><img src="https://img.shields.io/badge/Support_me_on_Ko--fi-F16061?style=for-the-badge&logo=ko-fi&logoColor=white" alt="Ko-fi"></a>
-</div>
+> **This is not a PC port of Peanuts Native.** Peanuts Native is an Android project. Peanuts Desktop is intended to run on a desktop computer (with Linux and SteamOS, including the Steam Deck, as our primary focus) and help prepare builds for compatible Android devices. The AYN Thor is our first target device, while the workflow should remain useful for other supported Android devices too.
 
-> [!NOTE]
-> Peanuts Native is in development. The current release is on the [releases page](https://github.com/igawa6/peanuts-native/releases). It is not affiliated with Nintendo.
+## What we are trying to build
 
-## What it is
+A single, clear desktop interface for the existing Peanuts Native desktop build process:
 
-Peanuts Native turns a dump of a Switch 1 game you own into an Android app on your phone. It is not an emulator. The
-game's own ARM64 code is rewritten to run directly on the phone's CPU, its graphics are replayed on Vulkan, and its
-shaders are translated on the device. Everything happens on the phone: you pick the game file, tap Build, and play.
+- Select and inspect a user's own game dump or an existing intermediate package.
+- Guide the user through the inputs and options that the underlying builder actually supports.
+- Run the existing import and packaging steps without requiring users to assemble Python commands themselves.
+- Show meaningful progress, current stages, logs and actionable errors.
+- Where supported by the existing workflow, help transfer the finished Android build to a connected device using ADB.
 
-On a dual-screen handheld such as the AYN Thor, the game plays on the top screen and the bottom screen shows a
-companion for that game: a map, your party, items or quests, read live from the running game and touchable. Companions
-use the same package format as [Eden Duo](https://github.com/igawa6/eden-duo), so every Eden Duo companion works here
-too.
+The interface should make the process more intuitive and accessible without replacing the underlying builder or duplicating its game-building logic. We will first audit the existing scripts, interfaces, dependencies and platform limitations, then choose the smallest maintainable design that safely reuses them.
 
-## Supported games
+## What this project is not
 
-<!-- PEANUTS begin: the Supported games table, written by peanuts/scripts/games_catalog.py from peanuts/games.tsv, peanuts/release-titles.txt and the profiles. Edit peanuts/games.tsv, not this table -->
+- It is **not** a Windows or Linux version of the Peanuts Native Android app.
+- It is **not** a PC game port, emulator, or a way to run the resulting Switch games on the desktop.
+- It is **not** a replacement for Peanuts Native's Android app or its runtime.
+- It is **not** a new game-building engine. The intention is to provide a GUI for the existing desktop CLI workflow.
 
-Peanuts Native 0.1.6 includes 52 games. The Companion column shows whether a game appears in the Eden Duo Companions catalog. Updates are shown as version numbers or numeric update IDs.
+The desktop computer is the build host; the intended game runtime remains a compatible Android device.
 
-| Game | Title ID | Game update | Companion |
-|---|---|---|---|
-| The Legend of Zelda: Link's Awakening | `01006BB00C6F0000` | 1.1.0 | Yes |
-| The Legend of Zelda: Echoes of Wisdom | `01008CF01BAAC000` | 1.1.0 | Yes |
-| Fire Emblem: Three Houses | `010055D009F78000` | 1.2.0 | Yes |
-| Fire Emblem Engage | `0100A6301214E000` | 2.0.0 | Yes |
-| Metroid Dread | `010093801237C000` | 2.1.0 | Yes |
-| Super Mario Odyssey | `0100000000010000` | 1.4.1 | Yes |
-| Mario Kart 8 Deluxe | `0100152000022000` | 4.0.0, 4.0.1 | Yes |
-| Animal Crossing: New Horizons | `01006F8002326000` | 3.0.3 | Yes |
-| Persona 5 Royal | `01005CA01580E000` | 1.0.2 | Yes |
-| Castlevania: Belmont's Curse | `0100BA4026E94000` | 1.1.0 | Yes |
-| OCTOPATH TRAVELER 0 | `01005270232F2000` | 1.0.5 | Yes |
-| Pokémon Brilliant Diamond | `0100000011D90000` | 1.3.0 | Yes |
-| Pokémon Shining Pearl | `010018E011D92000` | 1.3.0 | Yes |
-| Pokémon Sword | `0100ABF008968000` | 1.3.2 | Yes |
-| Pokémon Shield | `01008DB008C2C000` | 1.3.2 | Yes |
-| The Legend of Zelda: Breath of the Wild | `01007EF00011E000` | 1.6.0, 1.9.0 | Yes |
-| The Legend of Zelda: Tears of the Kingdom | `0100F2C0115B6000` | 1.4.3 | No |
-| FINAL FANTASY RESONANCE | `0100606026F12000` | 1.0.1 | No |
-| The Legend of Zelda: Skyward Sword HD | `01002DA013484000` | 1.0.1 | Yes |
-| Pokémon Legends: Arceus | `01001F5010DFA000` | 1.1.1 | No |
-| Resident Evil 4 | `010099A00BC1E000` | 131072 | Yes |
-| Kirby and the Forgotten Land | `01004D300C5AE000` | 1.1.0 | No |
-| Kirby's Return to Dream Land Deluxe | `01006B601380E000` | 1.0.0 | Yes |
-| Super Mario 3D World + Bowser's Fury | `010028600EBDA000` | 1.2.2 | No |
-| Super Mario Bros. Wonder | `010015100B514000` | 1.2.1 | Yes |
-| DRAGON QUEST III HD-2D Remake | `01003E601E324000` | 1.1.2 | Yes |
-| Chained Echoes | `0100C510166F0000` | 1.41 | Yes |
-| Yoru, Tomosu | `0100C2901153C000` | Base game (v0) | Yes |
-| Crash Team Racing Nitro-Fueled | `0100F9F00C696000` | 1.0.15 | Yes |
-| Captain Tsubasa 2: World Fighters | `01009720213B0000` | 1.0.6 | No |
-| DAVE THE DIVER | `010097F018538000` | 1.0.6.1267 | Yes |
-| Demon Slayer -Kimetsu no Yaiba- The Hinokami Chronicles 2 | `0100AD80208A8000` | 1.80 | No |
-| Xenoblade Chronicles X: Definitive Edition | `0100453019AA8000` | 1.0.2 | No |
-| My Time at Sandrock | `0100B63016916000` | 1.4.2.0 | Yes |
-| Monster Sanctuary | `0100A0F00DA68000` | 2.1.0 | Yes |
-| Astral Chain | `01007300020FA000` | 1.0.1 | No |
-| Diablo III: Eternal Collection | `01001B300B9BE000` | 2.7.7.92380 | Yes |
-| EA Sports FC 27 | `0100C49025D3E000` | 1.8d.6523, 1.8d.f570 | No |
-| Tomodachi Life: Living the Dream | `010051F0207B2000` | 1.0.4 | No |
-| Unicorn Overlord | `010069401ADB8000` | 1.05 | No |
-| Luigi's Mansion 3 | `0100DCA0064A6000` | 1.4.0 | No |
-| Pokémon Legends: Z-A | `0100F43008C44000` | 2.0.2 | No |
-| STORY OF SEASONS: Grand Bazaar | `0100DAE01E4C8000` | v655360 | No |
-| Double Dragon Revive | `01006AE02236C000` | 1.0.0, N1.10 | No |
-| Trails in the Sky 2nd Chapter | `01007A2027548000` | 1.0.3 | No |
-| DRAGON BALL: Sparking! ZERO | `010035F022078000` | 1.0.0 | No |
-| Pokémon Scarlet | `0100A3D008C5C000` | 4.0.0 | No |
-| Pokémon Violet | `01008F6008C5E000` | 4.0.0 | No |
-| DRAGON BALL Z: KAKAROT + A NEW POWER AWAKENS SET | `010051C0134F8000` | 1.70 | No |
-| STEINS;GATE RE:BOOT | `01008BC024FDE000` | 1.0.3, 1.0.4 | No |
-| NieR:Automata The End of YoRHa Edition (Asian release) | `0100B8E016F76000` | 1.0.3 | No |
-| Hyrule Warriors: Age of Calamity | `01002B00111A2000` | 1.3.0 | No |
+## Current status
 
-<!-- PEANUTS end: the Supported games table -->
+**Early audit and design stage — no new desktop application is being claimed as complete.**
 
-The 0.1.6 release candidate installed over 0.1.5 on an AYN Thor with its saves kept. Nine of the 13 new games reached early gameplay on an AYN Thor with Turnip, among them the Hyrule Field battle in Hyrule Warriors: Age of Calamity and Lumiose Station in Pokémon Legends: Z-A. The other four were checked on other Android devices.
+The upstream repository already contains desktop build scripts and a Tk-based `scripts/pack_gui.py` for the packaging stage. That existing GUI is not the same as the broader, integrated workflow we are investigating. We will inspect what it already does and reuse it where appropriate rather than assume we need to rewrite it.
 
-## What you need
+The current builder documentation is the source of truth for supported inputs, options, dependencies and limitations:
 
-- A dual-screen Android handheld. Peanuts Native is developed and tested on the AYN Thor. On a single-screen phone the
-  game still runs, without the companion.
-- Android 13 or later, a Snapdragon GPU with Vulkan 1.3, and 12 GB of RAM or more. A Turnip Vulkan driver is
-  recommended; the app can download one.
-- Free storage for the game and its build. Plan for the size of the game plus a few GB.
-- Your own `prod.keys`, your own firmware dump (a folder or a `.zip`) and your own game dump (NSP, XCI, either compressed
-  as NSZ or XCZ, or a dump folder), with its update. <!-- PEANUTS: .nsz and .xcz (issue #149) -->
+- [Peanuts Native desktop builder documentation](peanuts/docs/BUILDER.md)
+- [Existing pack-stage GUI](scripts/pack_gui.py)
+- [Upstream Peanuts Native project](https://github.com/igawa6/peanuts-native)
 
-## Your keys and games
+Features, platform support and device-transfer behavior will only be advertised here after they have been implemented and verified.
 
-Peanuts Native only runs games you dumped from your own console, with keys from that console. It contains no Nintendo
-code, firmware or keys, never downloads any, and does not link to places that offer them. Nobody from this project
-will ever ask you for money, keys or game files.
+## Design principles
 
-## Getting started
+1. **Reuse before rewriting.** Keep the existing builder as the source of truth for build behavior.
+2. **Make complexity understandable.** Present clear steps, safe defaults, useful progress and readable errors.
+3. **Do not hide limitations.** If the builder cannot handle a game or operation, the GUI must explain that rather than imply success.
+4. **SteamOS/Linux first.** Prioritize a reliable experience on Linux desktop and SteamOS, then assess other platforms deliberately.
+5. **Android is the destination.** Keep the AYN Thor as the first device target without unnecessarily hard-coding the application to one device.
+6. **Security is mandatory.** User keys, firmware, game dumps and credentials stay local and must never be committed, uploaded, logged or transmitted by the GUI.
 
-1. Install the APK and allow All files access when asked.
-2. On the first screen, add your **Keys** (`prod.keys`), pick your **Game folder**, and add your **Firmware**. Both
-   keys and firmware are needed before the first build. A build folder is optional (Settings, Library, **Build
-   folder**): pick one, on the phone or the microSD card, to keep every build there, organized by title ID.
-3. Open a game from the library and tap **Build**. The app imports the game, rewrites its code, translates its
-   shaders and installs its companion. Most games take 5 to 40 minutes on the Thor.
-4. Tap the game to play. The companion starts on the bottom screen.
+## Security and user-owned files
 
-Hold a game's cover to open its own page: picture and speed settings, mods, the companion, saves and storage.
-After an app update, rebuilding every game is strongly recommended: hold the cover, open **Storage**, tap
-**Build again**, then **Rebuild**.
+This is a public repository. **Never commit or share `prod.keys`, other key files, firmware, game dumps, built game packages, credentials, tokens, private configuration or personal data.** Do not paste their contents into issues, pull requests, logs, screenshots or AI work orders.
 
-## Settings worth knowing
+Use local files and secure local configuration for sensitive inputs. Review every staged change before committing or pushing. The repository's [SECURITY.md](SECURITY.md) defines the mandatory safeguards for contributors and automated coding agents.
 
-- **Console mode**: Docked or Handheld, for all games in Settings and per game on its page. It can also be changed
-  while the game runs, from the in-game panel.
-- **Resolution scale** (first version): 0.5x to 2x of the size the game draws at. Not every effect follows it.
-- **Mods** (first version): hold the cover, **Game** tab, **Mods**. Install a mod from a folder or a zip. It is on
-  from the game's next start, and each mod has a switch and a delete button. A mod that changes the game's code gets
-  a build with mods, which starts by itself (it waits while another build runs). Until that build is ready, the game
-  starts without that mod. After a failed build, tap **Build with mods** to try again.
-- **Saves**: back up, restore, import and **Delete save data** on the game's **Saves** tab.
+The underlying Peanuts Native builder documentation explains the expected local inputs and workflow. Users are responsible for supplying files they are legally entitled to use.
 
-A game can also be built on a computer and pushed to the device: see [BUILDER.md](peanuts/docs/BUILDER.md). The builder is tested
-on macOS and Linux. Windows is written but not tested yet. On Linux it also builds four games whose shaders are
-Oodle-compressed or in Unreal archives; for the Oodle ones it compiles a separate open-source decoder (ooz,
-GPL-3.0-or-later), which is used on the computer only and is not part of the app.
+## Relationship to Peanuts Native
 
-## Companions
+This repository is based on [igawa6/peanuts-native](https://github.com/igawa6/peanuts-native). The upstream project remains the source of the Android application, game profiles, build tools and their documentation. This repository's intended contribution is the desktop user interface around the existing build workflow.
 
-Open Settings, then Companions, to see every companion and every release of it. You can install, update, remove or
-roll back to an earlier release, and each download is checked against its published checksum before it is used. A
-game without a companion leaves the bottom screen free for Android. Companion screens give haptic feedback when you
-tap them.
+Please consult upstream documentation and preserve its attribution and licensing notices. This project does not claim ownership of Peanuts Native or its underlying components.
 
-The companions themselves are published in
-[eden-duo-companions](https://github.com/igawa6/eden-duo-companions), with screenshots and what each one shows.
+## Development approach
 
-## FAQ
+Work will proceed in deliberate stages:
 
-**Is this piracy?** No. It runs only a dump of a game you own, made from your own console, and ships no game code,
-firmware or keys.
+1. Audit the builder, existing GUI, command interfaces, dependencies and SteamOS compatibility.
+2. Define the smallest useful GUI workflow based on verified capabilities.
+3. Implement the interface while keeping build operations delegated to the existing tools.
+4. Add tests for input validation, subprocess handling, progress reporting, cancellation, file safety and device transfer.
+5. Verify on SteamOS/Linux and the AYN Thor before describing features as supported.
 
-**My game update is different from the table. Will it work?** The game's page tells you. Some games support more than
-one update; others need the exact one listed. For an unsupported update the app asks before building, and the result
-may not start.
-
-**Can I share my built game or its shaders?** No. Both are made from your own game's files. Share nothing derived
-from a game, and point other players to their own dump instead.
-
-**Does the companion slow the game down?** Very little. The games above hold their frame rate with the companion
-running.
-
-More questions and troubleshooting: [FAQ.md](peanuts/docs/FAQ.md).
-
-## Contributing
-
-See [CONTRIBUTING.md](peanuts/docs/CONTRIBUTING.md) for adding a game, fixing a bug and testing on a device. Run
-`sh peanuts/scripts/install-hooks.sh` once after cloning.
-
-## Credits and license
-
-Peanuts Native is a fork of [Banana Native](https://git.eden-emu.dev/moceure/BananaNative) by moceure, which does the
-real work of running Switch games natively on Android and is built on [nxnative](https://github.com/seedds/nxnative)
-by seedds (MIT). Some fixes are adapted from [nx2android](https://github.com/shirai91/nx2android) (MIT).
-
-The companion runtime and package format come from [Eden Duo](https://github.com/igawa6/eden-duo).
-
-Contributors: <!-- PEANUTS: the contributor list of this fork -->
-
-- [intermission88](https://github.com/intermission88): the builder for PC, Mac and Linux (`peanuts/docs/BUILDER.md`, pull request #13), the profiles of Kirby's Return to Dream Land Deluxe, Kirby and the Forgotten Land and Super Mario 3D World + Bowser's Fury (pull requests #34, #84 and #83), the guide for adding a game (`peanuts/docs/NEW-GAME.md`, pull request #34), and fixes to the on-device packer, the release notes popup and the Unreal shader step (pull requests #37, #35 and #71).
-- [davdxpx](https://github.com/davdxpx): the issue and discussion forms rebuilt from the ground up, with a game catalog that also keeps the Supported games table up to date (pull request #175), building from .nsz and .xcz files, the launcher and companion on the second screen, Swap screens, the GPU driver page, Share build log, game icons that outlive their NSP, companion release notes, and many smaller fixes across the app.
-- [elliott-groves](https://github.com/elliott-groves): development builds that install beside the Peanuts Native app (pull request #60).
-- [tapionallanaire](https://github.com/tapionallanaire): building the APK on Windows (pull request #54), and the Trails in the Sky 2nd Chapter and Double Dragon Revive profiles (pull requests #164 and #197).
-- [dnyan007](https://github.com/dnyan007): the DRAGON BALL: Sparking! ZERO profile and the sync of GPU-written terrain into block-compressed textures (pull requests #168 and #167).
-- [skyhong2002](https://github.com/skyhong2002): STEINS;GATE RE:BOOT 1.0.4, standalone NUP updates in the library, and Prepare surviving a missed job status read (pull requests #192, #185 and #181).
-- [ArchOwlen](https://github.com/ArchOwlen): the first issue and discussion forms (pull request #5).
-
-The project as a whole is licensed GPL-3.0-or-later. Frame generation (ported from Eden and lsfg-vk) and other
-components carry their own licenses; see `android/NOTICE.md` and `dm/third_party/README.md`.
+Until those steps are complete, this README describes the project's purpose and direction, not a promise that the proposed features are already available.
