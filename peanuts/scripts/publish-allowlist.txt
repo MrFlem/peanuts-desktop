@@ -1,0 +1,20 @@
+# Rule 2 exemptions for peanuts/scripts/check-publish.sh, one exact line at a time.
+#
+# The Desktop redaction tests have to hand the redactor the very shapes it masks - a home folder, a mount path,
+# a device address - so a required fixture looks like the private data the publish gate exists to stop. Each
+# line below is the promise that one such line is fictional and needed: <path><TAB><the line, byte for byte>.
+#
+# The gate collects every private-looking line in the changed files and compares it with this list, so:
+#   - a private-looking line that is not listed here fails, including a second copy of a listed line;
+#   - a listed line that is missing or edited fails, so update its entry to the line's new text;
+#   - only peanuts/tests/ may be listed. No line numbers, no whole files, no directory prefixes, no switch.
+# The rest of each affected file is still checked: the exemption is one line, and one reviewable promise.
+# This file is the gate's own data, like the gate, so the gate does not scan it; it is reviewed with the change.
+peanuts/tests/test_desktop_engine.py	        self.assertEqual(redact('/home/alice/games/x'), '/home/<user>/games/x')
+peanuts/tests/test_desktop_engine.py	        self.assertEqual(redact('/Users/alice/Library/x'), '/Users/<user>/Library/x')
+peanuts/tests/test_desktop_engine.py	        self.assertIn('<user>', redact(r'C:\Users\alice\games\x'))
+peanuts/tests/test_desktop_engine.py	        once = redact('/home/alice/games/x')
+peanuts/tests/test_desktop_engine.py	        run = SupervisedProcess([sys.executable, '-u', '-c', 'pass', '/home/alice/games/x.nsp'],
+peanuts/tests/test_desktop_engine.py	        text = redact(f'{self.SERIAL.lower()}:5555')
+peanuts/tests/test_desktop_model.py	        plan = plan_for(info(kind=Kind.FILE), keys='/home/someone/prod.keys')
+peanuts/tests/test_desktop_model.py	        self.assertIn('/home/someone/prod.keys', argv)
