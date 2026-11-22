@@ -36,9 +36,10 @@ cat > "$hooks/pre-push" <<EOF
 #   * a new branch or a non-fast-forward push: no remote tip is a usable baseline, so the gate's own baseline (the
 #     merge base with upstream) with the pushed commit as the target - the whole branch, not only its newest commit;
 #   * a deleted ref (local sha all zeros): nothing is published, so nothing is checked.
-# A record that is empty, is not four fields, does not name two commits, or is not terminated by a newline refuses
-# the push: an input this hook cannot read whole is never treated as a shorter one, and a final record that `read`
-# used to drop is refused rather than skipped.
+# A record that is empty, is not four fields, does not name two commits of this repository's own id length (40 hex
+# digits in a sha1 repository, 64 in a sha256 one), or is not terminated by a newline refuses the push: an input
+# this hook cannot read whole is never treated as a shorter one, and a final record that `read` used to drop is
+# refused rather than skipped.
 # Every update is checked even after one fails, so one push reports all of its problems. A push whose records
 # cannot be captured, read or replayed is refused: an unknown set of updates is never treated as an empty one.
 set -u
@@ -58,7 +59,27 @@ gate="\$top/peanuts/scripts/check-publish.sh"
 [ -f "\$gate" ] || { echo "pre-push: \$gate is missing: refusing to push without the publishing gate"; exit 1; }
 [ -r "\$tmp" ] || { echo 'pre-push: the ref updates could not be read back: refusing to push'; exit 1; }
 exec 3< "\$tmp"   # read them with a descriptor of their own, so nothing else can consume them
-zero=0000000000000000000000000000000000000000
+# A commit id is hex digits of this repository's own length: 40 for sha1, 64 for sha256. An id of any other length
+# is not a commit here, and the ancestry test below would fail for it and quietly fall back to the gate's own
+# baseline - so an overlong or truncated id would be accepted as "no usable remote tip" rather than refused.
+oidlen=
+if oidformat=\$(git rev-parse --show-object-format 2>/dev/null) && [ -n "\$oidformat" ]; then
+    case \$oidformat in
+        sha1) oidlen=40 ;;
+        sha256) oidlen=64 ;;
+        *) echo "pre-push: this repository uses an object format this hook does not know (\$oidformat): refusing to push"; exit 1 ;;
+    esac
+else
+    # A git older than 2.29 does not answer that question: the checked-out commit id says which format this is.
+    head_sha=\$(git rev-parse --verify -q HEAD 2>/dev/null) || head_sha=
+    case \${#head_sha} in
+        40) oidlen=40 ;;
+        64) oidlen=64 ;;
+        *) echo "pre-push: cannot tell this repository's object format: refusing to push"; exit 1 ;;
+    esac
+fi
+zero=\$(printf '%*s' "\$oidlen" '' | tr ' ' 0) \\
+    || { echo 'pre-push: cannot build the all-zero id for this object format: refusing to push'; exit 1; }
 status=0
 checked=0
 while :; do
@@ -86,13 +107,13 @@ while :; do
     case \$local_sha in
         '' | *[!0-9a-f]*) echo 'pre-push: a ref update does not name a commit: refusing to push'; status=1; continue ;;
     esac
-    [ \${#local_sha} -ge 40 ] \\
-        || { echo 'pre-push: a ref update does not name a commit: refusing to push'; status=1; continue; }
+    [ \${#local_sha} -eq "\$oidlen" ] \\
+        || { echo "pre-push: a ref update does not name a commit of this repository's length (\$oidlen hex digits): refusing to push"; status=1; continue; }
     case \$remote_sha in
         '' | *[!0-9a-f]*) echo 'pre-push: a ref update does not name a remote commit: refusing to push'; status=1; continue ;;
     esac
-    [ \${#remote_sha} -ge 40 ] \\
-        || { echo 'pre-push: a ref update does not name a remote commit: refusing to push'; status=1; continue; }
+    [ \${#remote_sha} -eq "\$oidlen" ] \\
+        || { echo "pre-push: a ref update does not name a remote commit of this repository's length (\$oidlen hex digits): refusing to push"; status=1; continue; }
     if [ "\$terminated" = 0 ]; then
         echo 'pre-push: the last ref update is not terminated by a newline: refusing to push'
         status=1

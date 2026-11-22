@@ -66,6 +66,10 @@
 #       line is no longer exempt there, so it is reported; a file no commit in this range touches is not read by
 #       that scan, so it is re-read at the target when an entry this range ever published is gone from it: a
 #       revocation cannot leave the content it used to cover exempt;
+#     * the entries a range ever published are gathered from each commit's allowlist one blob at a time, never by
+#       appending the blobs to each other: a blob is a whole file, and its last record may have no newline, which
+#       concatenation would run into the next blob's first record - a comment at the end of one blob would then
+#       swallow the entry that opens the next, and a revoked exemption would never be re-checked;
 #     * one entry exempts one occurrence in each version, so a second copy of a listed line fails;
 #     * every entry of the target's allowlist has to describe exactly one line of its file at the target, whether
 #       or not this range touches that file, so an entry the file no longer keeps is stale rather than dormant.
@@ -247,9 +251,20 @@ allowlist_at() {   # <ref> <output file>: the allowlist as published at that com
 	fi
 	: > "$2"   # no allowlist in that commit: no exemptions
 }
+# allowlist_records <allowlist file> <output file>: the records of one blob, one per line, whatever its last byte is.
+# A blob is a whole file, and its final record may have no newline; appending blobs to each other would run that
+# record into the next blob's first one, so each is read on its own here and written out terminated. The records
+# themselves are not normalized - an entry has to reach its comparison byte for byte - and blank lines are dropped.
+allowlist_records() {
+	[ -s "$1" ] || return 0
+	while IFS= read -r ar_record || [ -n "$ar_record" ]; do
+		[ -n "$ar_record" ] || continue
+		printf '%s\n' "$ar_record" >> "$2" || die "cannot record the allowlist entries of $1"
+	done < "$1"
+}
 allowlist_at "$target" "$tmp.allow" || exit 1
 allowlist_at "$since" "$tmp.allows" || exit 1
-cat "$tmp.allows" >> "$tmp.everallow" || die "cannot read the baseline commit's allowlist"
+allowlist_records "$tmp.allows" "$tmp.everallow"
 
 for c in $revs; do
 	changed_files "$c" 'ACMRT' > "$tmp.changed" \
@@ -363,7 +378,7 @@ for c in $revs; do
 	changed_files "$c" 'ACMRT' > "$tmp.changed" \
 		|| die "git diff-tree $c failed: the gate cannot list what that commit changes"
 	allowlist_at "$c" "$tmp.allowc" || exit 1
-	cat "$tmp.allowc" >> "$tmp.everallow" || die "cannot read the allowlist of commit $c"
+	allowlist_records "$tmp.allowc" "$tmp.everallow"
 	LC_ALL=C sort -u "$tmp.changed" > "$tmp.changed.u" || die "sort failed on $c's changed files"
 	while IFS= read -r f; do
 		[ -n "$f" ] || continue

@@ -111,7 +111,8 @@ this project has touched, and which edits are marked / queued for a Banana Nativ
   committed file or message; use placeholders (`<work dir>`, `<device ip>`).
 - `sh peanuts/scripts/check-publish.sh` must print "clean" before any push. It reads the commits being published
   (never the working tree), including the allowlist from the target commit, and the `pre-push` hook gives it each
-  pushed ref's own range after capturing the reference updates and replaying them to any chained hook;
+  pushed ref's own range after capturing the reference updates and replaying them to any chained hook; a ref update
+  whose commit ids are not this repository's own length (40 hex for sha1, 64 for sha256) is refused, not guessed at;
   CONTRIBUTING.md "Publishing rules" says what it finds and what it cannot.
 
 ## Where findings go

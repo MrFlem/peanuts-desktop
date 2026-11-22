@@ -226,13 +226,18 @@ If you hit this symptom on a new title, look for it before assuming the pack is 
   deletion of it cannot change a verdict, and an exemption counts only once it is published. Every entry has to
   describe exactly one line of its file at the target commit, whether or not this push touches that file; and an
   entry the push revokes re-reads the content it used to cover at the target, so revoking an exemption cannot leave
-  a retained fixture line exempt. A missing object, or a git command that cannot inspect a tree, fails the gate. The
+  a retained fixture line exempt. The history of the allowlist is read one published blob at a time, never by
+  appending the blobs to each other: a file whose last line has no newline would otherwise run that entry into the
+  next commit's first one, and a comment there could swallow an entry a revocation then never re-checks. A missing
+  object, or a git command that cannot inspect a tree, fails the gate. The
   `pre-push` hook captures this push's
   reference updates once, replays them to any `pre-push.local` it chains, then hands the gate the range of each ref
   it is about to publish (a fast-forward's added commits; the whole branch for a new one or a non-fast-forward
   push), so neither a chained hook that consumes standard input nor an assumption that `HEAD` is what is being
-  pushed can make it check nothing. A record that is empty, is not four fields, does not name two commits, or is not
-  terminated by a newline refuses the push, so a record it cannot read whole is never silently dropped. Every `git`,
+  pushed can make it check nothing. A record that is empty, is not four fields, does not name two commit ids of this
+  repository's own length (40 hex digits for sha1, 64 for sha256 - an overlong or truncated id used to fall back to
+  the gate's own baseline), or is not terminated by a newline refuses the push, so a record it cannot read whole is
+  never silently dropped or trusted. Every `git`,
   `awk` and `grep` command it runs is checked on its own: a failure fails the gate, it never produces a clean one.
 - **What the gate cannot do.** It is a regular-expression scan of text: the shapes are listed at the top of
   `check-publish.sh` (LAN and adb addresses, home and mount paths, assistant work folders, personal e-mail

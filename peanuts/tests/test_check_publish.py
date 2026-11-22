@@ -454,6 +454,99 @@ class AllowlistFromTheTarget(Base):
         self.assertNotIn('clean', r.stdout)
 
 
+class HistoricalAllowlistBoundaries(Base):
+    """A2: a range's allowlists are read blob by blob, never by concatenating their bytes.
+
+    A blob is a whole file, and its last record may have no newline. Appending the blobs to each other runs that
+    record into the next blob's first one, and when the first is a comment the entry that follows it disappears
+    from the range's history: a revoked exemption is then never re-checked, and the gate reports a clean
+    publication for a fixture that is still published with no exemption at all (the false negative Codex found).
+    """
+
+    def fixture_path(self):
+        return 'peanuts/tests/test_hist_fixture.py'
+
+    def line(self, name='alice'):
+        return "        KEYS = '" + homed(name) + "/keys/prod.keys'"
+
+    def revoked_history(self, unterminated):
+        """The fixture and its entry are committed inside the range; the target revokes the entry.
+
+        `unterminated` says which blob ends with a record that has no newline, and so which blob's first record is
+        at risk: 'newest' is the target's own comment (the entry opens the blob of the commit just below it),
+        'intermediate' is a comment in a commit between the entry's and the target's.
+        """
+        line = self.line()
+        self.commit_lines(self.fixture_path(), [line])
+        self.set_allowlist('# no exemptions yet\n', message='the baseline allowlist')
+        since = self.git('rev-parse', 'HEAD')
+        self.set_allowlist(self.fixture_path() + '\t' + line + '\n', message='the fixture and its entry')
+        if unterminated == 'intermediate':
+            self.set_allowlist('# the list continues below, and this line has no newline',
+                               message='an intermediate comment with no trailing newline')
+        self.set_allowlist('# the exemption is revoked here' + ('' if unterminated == 'newest' else '\n'),
+                           message='revokes the exemption')
+        return since
+
+    def test_a_revocation_is_found_when_the_target_blob_has_no_trailing_newline(self):
+        since = self.revoked_history('newest')
+        r = self.check('--since', since)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn(self.fixture_path() + ':1:', r.stdout)
+        self.assertIn('home-path', r.stdout)
+        self.assertNotIn('clean', r.stdout)
+        self.assertNotIn(homed('alice'), r.stdout)
+
+    def test_a_revocation_is_found_when_an_intermediate_blob_has_no_trailing_newline(self):
+        since = self.revoked_history('intermediate')
+        r = self.check('--since', since)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn(self.fixture_path() + ':1:', r.stdout)
+        self.assertIn('home-path', r.stdout)
+        self.assertNotIn('clean', r.stdout)
+
+    def test_the_same_revocation_is_found_when_every_blob_ends_with_a_newline(self):
+        # The control: the revocation is the only thing that changed here, so the two tests above fail for the
+        # missing newline and not for the fixtures or for the revocation itself.
+        line = self.line()
+        self.commit_lines(self.fixture_path(), [line])
+        self.set_allowlist('# no exemptions yet\n', message='the baseline allowlist')
+        since = self.git('rev-parse', 'HEAD')
+        self.set_allowlist(self.fixture_path() + '\t' + line + '\n', message='the fixture and its entry')
+        self.set_allowlist('# the exemption is revoked here\n', message='revokes the exemption')
+        r = self.check('--since', since)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn(self.fixture_path() + ':1:', r.stdout)
+        self.assertNotIn('clean', r.stdout)
+
+    def test_a_baseline_blob_without_a_trailing_newline_stays_clean_when_its_entry_is_kept(self):
+        # The harmless side of the same shape: the target keeps the entry, so the entry the history holds still
+        # names an exemption the target publishes. Nothing should be reported for a shorter file ending.
+        line = self.line()
+        self.commit_lines(self.fixture_path(), [line])
+        self.set_allowlist(self.fixture_path() + '\t' + line + '\n# the list ends here', message='the baseline')
+        since = self.git('rev-parse', 'HEAD')
+        self.commit('unrelated.txt', 'a change that does not touch the fixture')
+        r = self.check('--since', since)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('clean', r.stdout)
+
+    def test_an_entry_repeated_across_two_blobs_is_not_a_duplicate_error(self):
+        # The duplicate rule is one entry per fixture line in the target's allowlist; the same entry committed
+        # twice in the range's history is ordinary history and collapses to one.
+        line = self.line()
+        self.commit_lines(self.fixture_path(), [line])
+        self.set_allowlist('# no exemptions yet\n', message='the baseline allowlist')
+        since = self.git('rev-parse', 'HEAD')
+        self.set_allowlist(self.fixture_path() + '\t' + line + '\n', message='the fixture and its entry')
+        # The same allowlist published again: a second commit whose blob repeats the entry.
+        self.git('commit', '-q', '--allow-empty', '-m', 'the same entry, committed again')
+        r = self.check('--since', since)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('clean', r.stdout)
+        self.assertNotIn('repeats an earlier entry', r.stdout)
+
+
 class Loopback(Base):
     """A loopback host is not a network address, and must not hide one beside it on the same line."""
 
@@ -893,8 +986,80 @@ class PrePushHook(Base):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn('clean', r.stdout)
 
+    def test_a_record_with_an_overlong_remote_commit_is_refused(self):
+        # Codex's case: 41 hex digits cleared the old "at least 40" test, failed the ancestry test, and were read
+        # as "no usable remote tip" - the gate then checked the branch and the push was allowed.
+        sha = self.git('rev-parse', 'HEAD')
+        r = self.push_raw('refs/heads/main %s refs/heads/main %s\n' % (sha, ZERO + '0'))
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("does not name a remote commit of this repository's length (40 hex digits)", r.stdout)
+        self.assertNotIn('clean', r.stdout)
+
+    def test_a_record_with_an_overlong_commit_id_is_refused(self):
+        sha = self.git('rev-parse', 'HEAD')
+        r = self.push_raw('refs/heads/main %s0 refs/heads/main %s\n' % (sha, ZERO))
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("does not name a commit of this repository's length (40 hex digits)", r.stdout)
+
+    def test_a_record_with_a_sha256_length_id_is_refused_in_a_sha1_repository(self):
+        sha = self.git('rev-parse', 'HEAD')
+        r = self.push_raw('refs/heads/main %s refs/heads/main %s\n' % (sha, '0' * 64))
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("does not name a remote commit of this repository's length (40 hex digits)", r.stdout)
+
     def test_a_deleted_ref_publishes_nothing(self):
         r = self.push(('(delete)', ZERO, 'refs/heads/gone', self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('only deletes refs', r.stdout)
+
+
+class Sha256Repository(Base):
+    """A3: the id length is the repository's own object format, not "at least 40"."""
+
+    def push(self, *updates):
+        return self.push_raw(''.join('%s %s %s %s\n' % u for u in updates))
+
+    def push_raw(self, stdin):
+        return subprocess.run(['sh', self.hook, 'origin', 'https://example.org/repo.git'],
+                              cwd=self.repo, input=stdin, capture_output=True, text=True)
+
+    def setUp(self):
+        self.repo = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+        made = subprocess.run(['git', 'init', '-q', '--object-format=sha256'], cwd=self.repo,
+                              capture_output=True, text=True)
+        if made.returncode != 0:
+            self.skipTest('this git cannot make a sha256 repository')
+        self.git('config', 'user.name', 'Tester')
+        self.git('config', 'user.email', 'tester@example.org')
+        os.makedirs(os.path.join(self.repo, 'peanuts', 'scripts'))
+        shutil.copy(SCRIPT, os.path.join(self.repo, GATE))
+        self.write('peanuts/scripts/publish-allowlist.txt', '# no exemptions in this fixture repository\n')
+        self.branch = self.git('symbolic-ref', '--short', 'HEAD')
+        self.commit('base.txt', 'upstream')
+        self.base = self.git('rev-parse', 'HEAD')
+        self.commit('mine.txt', 'a contributor')
+        shutil.copy(HOOKS, os.path.join(self.repo, 'peanuts', 'scripts', 'install-hooks.sh'))
+        subprocess.run(['sh', 'peanuts/scripts/install-hooks.sh'], cwd=self.repo, check=True,
+                       capture_output=True, text=True)
+        self.hook = os.path.join(self.repo, '.git', 'hooks', 'pre-push')
+        self.git('update-ref', 'refs/remotes/upstream/main', self.base)
+
+    def test_a_record_with_sha256_ids_is_accepted(self):
+        sha = self.git('rev-parse', 'HEAD')
+        self.assertEqual(len(sha), 64)
+        r = self.push(('refs/heads/topic', sha, 'refs/heads/topic', '0' * 64))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('clean', r.stdout)
+
+    def test_a_sha1_length_id_is_refused_in_a_sha256_repository(self):
+        sha = self.git('rev-parse', 'HEAD')
+        r = self.push_raw('refs/heads/main %s refs/heads/main %s\n' % (sha, '0' * 40))
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("does not name a remote commit of this repository's length (64 hex digits)", r.stdout)
+
+    def test_a_deleted_ref_uses_the_sha256_zero_id(self):
+        r = self.push(('(delete)', '0' * 64, 'refs/heads/gone', self.base))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn('only deletes refs', r.stdout)
 
