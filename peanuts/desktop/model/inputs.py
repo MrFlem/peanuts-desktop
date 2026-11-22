@@ -18,6 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .. import repo_root
+from ..engine.redact import redact
 
 # The file types the importer reads (peanuts/scripts/peanuts_build.py: GAME_EXTS).
 GAME_EXTS = ('.nsp', '.xci', '.nsz', '.xcz')
@@ -165,10 +166,25 @@ def classify(path):
                            'top level')
 
 
+def diagnostic(text):
+    """A reader's own error sentence as the window may show it.
+
+    A reader's message names the path it was given - often the one the user chose, sometimes one it found under it -
+    and it reaches the About label, the Plan pane's blocker and any screenshot of them. It passes through the same
+    redaction as the log's lines (engine/redact.py), so a home folder becomes `~` or `<user>` and a registered serial
+    is masked, while the file and the reason stay readable.
+    """
+    return redact(str(text))
+
+
 def summary(info):
-    """One sentence for the window: what was found, in the player's words."""
+    """One sentence for the window: what was found, in the player's words.
+
+    A failure is a reader's own sentence, so it is shown through diagnostic(): the other branches name only the
+    input's own name and its title ID, which are not private data.
+    """
     if info.error:
-        return info.error
+        return diagnostic(info.error)
     if info.kind is Kind.FILE:
         return f'{info.path.name}: a game file. Importing it needs your prod.keys; the builder reads the title ID from it.'
     if info.kind is Kind.GAMES:

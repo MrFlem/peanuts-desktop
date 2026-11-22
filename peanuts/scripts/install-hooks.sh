@@ -36,6 +36,9 @@ cat > "$hooks/pre-push" <<EOF
 #   * a new branch or a non-fast-forward push: no remote tip is a usable baseline, so the gate's own baseline (the
 #     merge base with upstream) with the pushed commit as the target - the whole branch, not only its newest commit;
 #   * a deleted ref (local sha all zeros): nothing is published, so nothing is checked.
+# A record that is empty, is not four fields, does not name two commits, or is not terminated by a newline refuses
+# the push: an input this hook cannot read whole is never treated as a shorter one, and a final record that `read`
+# used to drop is refused rather than skipped.
 # Every update is checked even after one fails, so one push reports all of its problems. A push whose records
 # cannot be captured, read or replayed is refused: an unknown set of updates is never treated as an empty one.
 set -u
@@ -58,8 +61,19 @@ exec 3< "\$tmp"   # read them with a descriptor of their own, so nothing else ca
 zero=0000000000000000000000000000000000000000
 status=0
 checked=0
-while IFS= read -r record <&3; do
-    [ -n "\$record" ] || continue
+while :; do
+    # One record. A last record with no newline is not one this hook can read whole: refuse it, never skip it.
+    if IFS= read -r record <&3; then
+        terminated=1
+    else
+        [ -n "\$record" ] || break
+        terminated=0
+    fi
+    if [ -z "\$record" ]; then
+        echo 'pre-push: a ref update is an empty record: refusing to push'
+        status=1
+        continue
+    fi
     # Four fields, as git documents; anything else is a record this hook cannot vouch for.
     set -- \$record
     if [ \$# -ne 4 ]; then
@@ -74,6 +88,15 @@ while IFS= read -r record <&3; do
     esac
     [ \${#local_sha} -ge 40 ] \\
         || { echo 'pre-push: a ref update does not name a commit: refusing to push'; status=1; continue; }
+    case \$remote_sha in
+        '' | *[!0-9a-f]*) echo 'pre-push: a ref update does not name a remote commit: refusing to push'; status=1; continue ;;
+    esac
+    [ \${#remote_sha} -ge 40 ] \\
+        || { echo 'pre-push: a ref update does not name a remote commit: refusing to push'; status=1; continue; }
+    if [ "\$terminated" = 0 ]; then
+        echo 'pre-push: the last ref update is not terminated by a newline: refusing to push'
+        status=1
+    fi
     [ "\$local_sha" = "\$zero" ] && continue
     checked=1
     if [ "\$remote_sha" != "\$zero" ] && git merge-base --is-ancestor "\$remote_sha" "\$local_sha" 2>/dev/null; then

@@ -50,9 +50,10 @@ class Base(unittest.TestCase):
         self.git('config', 'user.email', 'tester@example.org')
         os.makedirs(os.path.join(self.repo, 'peanuts', 'scripts'))
         shutil.copy(SCRIPT, os.path.join(self.repo, GATE))
-        shutil.copy(ALLOW, os.path.join(self.repo, 'peanuts', 'scripts', 'publish-allowlist.txt'))
-        # Both are committed with the base commit below: the gate reads the allowlist from the object store at
-        # <target-ref>, so a copy that only sat in the working tree would give it nothing to check.
+        # A committed allowlist with no entries: the tests that need one write and commit it themselves (the gate
+        # reads the allowlist from the object store at <target-ref>, so an uncommitted copy would give it nothing).
+        self.write('peanuts/scripts/publish-allowlist.txt', '# no exemptions in this fixture repository\n')
+        # The gate is committed with the base commit below, like the allowlist.
         self.branch = self.git('symbolic-ref', '--short', 'HEAD')
         self.commit('base.txt', 'upstream')
         self.base = self.git('rev-parse', 'HEAD')
@@ -80,6 +81,9 @@ class Base(unittest.TestCase):
 
     def check(self, *args, env=None):
         return subprocess.run(['sh', GATE, *args], cwd=self.repo, capture_output=True, text=True, env=env)
+
+    def allow_path(self):
+        return os.path.join(self.repo, 'peanuts', 'scripts', 'publish-allowlist.txt')
 
     def set_allowlist(self, text, message='the allowlist'):
         """Write the allowlist and commit it: the gate reads the published one, never the working tree."""
@@ -202,6 +206,14 @@ class CommittedObjects(Base):
 
 class FailClosed(Base):
     """A git command that fails is the gate failing, never a clean tree."""
+
+    def test_a_git_that_cannot_inspect_the_target_fails(self):
+        # A2: "could not look" is a failure, never "nothing there" - the allowlist and every file are read with
+        # git ls-tree first, so a failing inspection cannot pass for a tree without them.
+        r = self.check(self.base, env=self.stub_git('ls-tree'))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn('cannot look up', r.stdout)
+        self.assertNotIn('clean', r.stdout)
 
     def test_a_failing_git_log_fails(self):
         r = self.check(self.base, env=self.stub_git('log'))
@@ -356,6 +368,80 @@ class AllowlistFromTheTarget(Base):
         self.assertIn(self.fixture_path() + ':1:', r.stdout)
         self.assertNotIn('clean', r.stdout)
 
+    def test_a_locally_deleted_allowlist_does_not_change_the_verdict(self):
+        # A2: the committed allowlist decides. Removing the checkout's copy cannot revoke a published exemption,
+        # and nothing in the working tree is consulted to reach that verdict.
+        line = self.fixture()
+        self.commit_lines(self.fixture_path(), [line])
+        self.set_allowlist(self.fixture_path() + '\t' + line + '\n')
+        os.unlink(self.allow_path())
+        self.assertFalse(os.path.exists(self.allow_path()))
+        r = self.check(self.base)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('clean', r.stdout)
+
+    def test_a_local_replacement_of_the_allowlist_does_not_change_the_verdict_either(self):
+        line = self.fixture()
+        self.commit_lines(self.fixture_path(), [line])
+        self.set_allowlist(self.fixture_path() + '\t' + line + '\n')
+        # A different entry in the checkout, for a line that was never published.
+        self.write('peanuts/scripts/publish-allowlist.txt', self.fixture_path() + '\t' + self.fixture('bob') + '\n')
+        r = self.check(self.base)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('clean', r.stdout)
+
+    def test_a_locally_deleted_allowlist_cannot_hide_a_published_hit(self):
+        self.commit_lines(self.fixture_path(), [self.fixture()])
+        os.unlink(self.allow_path())
+        r = self.check(self.base)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn(self.fixture_path() + ':1:', r.stdout)
+        self.assertNotIn('clean', r.stdout)
+
+    def test_a_revoked_entry_rechecks_the_retained_fixture(self):
+        # A2.3: the fixture and its entry are committed before the range; a later commit only removes the entry.
+        # Nothing in the range touches the fixture file, so no scan of it happens - and its line is published with
+        # no exemption at all, which the gate has to report.
+        line = self.fixture()
+        self.commit_lines(self.fixture_path(), [line])
+        self.set_allowlist(self.fixture_path() + '\t' + line + '\n')
+        retained = self.git('rev-parse', 'HEAD')
+        self.set_allowlist('# the exemption is revoked; the fixture stays\n', message='revokes the exemption')
+        r = self.check('--since', retained)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn(self.fixture_path() + ':1:', r.stdout)
+        self.assertIn('home-path', r.stdout)
+        self.assertNotIn('clean', r.stdout)
+        self.assertNotIn(homed('alice'), r.stdout)
+
+    def test_a_retained_fixture_whose_entry_stays_is_clean(self):
+        # The other side of the same rule: re-evaluating retained content must not turn a kept promise into a hit.
+        line = self.fixture()
+        self.commit_lines(self.fixture_path(), [line])
+        self.set_allowlist(self.fixture_path() + '\t' + line + '\n')
+        retained = self.git('rev-parse', 'HEAD')
+        self.commit('unrelated.txt', 'a change that does not touch the fixture')
+        r = self.check('--since', retained)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('clean', r.stdout)
+
+    def test_an_entry_for_retained_content_is_validated_outside_the_range_too(self):
+        # A2.3: an entry whose line the committed file no longer holds is stale even when no commit in this range
+        # touches that file. It used to be skipped as "not exercised here", so a broken promise stayed silent.
+        line = self.fixture()
+        self.commit_lines(self.fixture_path(), [line])
+        self.set_allowlist(self.fixture_path() + '\t' + line + '\n')
+        self.write(self.fixture_path(), self.fixture('bob') + '\n')
+        self.git('add', '-A')
+        self.git('commit', '-q', '-m', 'the fixture line is edited, the entry is not')
+        stale_from = self.git('rev-parse', 'HEAD')
+        self.commit('unrelated.txt', 'a change that does not touch the fixture')
+        r = self.check('--since', stale_from)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn('stale publish-allowlist entry', r.stdout)
+        self.assertIn(self.fixture_path(), r.stdout)
+        self.assertNotIn('clean', r.stdout)
+
     def test_an_allowlist_object_the_gate_cannot_read_fails(self):
         line = self.fixture()
         self.commit_lines(self.fixture_path(), [line])
@@ -409,12 +495,13 @@ class Rule2Exemptions(Base):
     """The allowlist accepts the required fictional fixtures, and only those exact lines."""
 
     def fixtures(self):
-        """Write each allowlisted file with exactly its allowlisted lines, and commit them."""
+        """Write each allowlisted file with exactly its allowlisted lines, and commit them with their entries."""
         self.assertTrue(ENTRIES, 'the allowlist has no entries')
         for path in sorted({p for p, _ in ENTRIES}):
             self.write(path, ''.join(line + '\n' for p, line in ENTRIES if p == path))
         self.git('add', '-A')
         self.git('commit', '-q', '-m', 'the redaction fixtures')
+        self.set_allowlist(''.join(p + '\t' + line + '\n' for p, line in ENTRIES), 'the fixtures and their entries')
 
     def add_line(self, path, line):
         with open(os.path.join(self.repo, path), 'a', encoding='utf-8') as f:
@@ -613,10 +700,11 @@ class DetectionScope(Base):
         self.assertIn('clean', r.stdout)
 
     def test_the_limits_are_documented(self):
+        # The whole header: it grows as the policy does, and the limits are what must not be lost from it.
         with open(SCRIPT, encoding='utf-8') as f:
-            head = f.read(6000)
-        self.assertIn('cannot show that a change holds no secret', head)
-        self.assertIn('binary file is skipped', head)
+            header = f.read().split('set -u', 1)[0]
+        self.assertIn('cannot show that a change holds no secret', header)
+        self.assertIn('binary file is skipped', header)
 
 
 class PrePushHook(Base):
@@ -765,6 +853,45 @@ class PrePushHook(Base):
         r = self.push_raw('refs/heads/main nothex refs/heads/main ' + ZERO + '\n')
         self.assertNotEqual(r.returncode, 0, r.stdout)
         self.assertIn('does not name a commit', r.stdout)
+
+    def test_a_record_with_a_short_commit_id_is_refused(self):
+        r = self.push_raw('refs/heads/main abcdef0 refs/heads/main ' + ZERO + '\n')
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn('does not name a commit', r.stdout)
+
+    def test_a_record_with_a_bad_remote_commit_is_refused(self):
+        sha = self.git('rev-parse', 'HEAD')
+        r = self.push_raw('refs/heads/main %s refs/heads/main nothex\n' % sha)
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn('does not name a remote commit', r.stdout)
+
+    def test_a_last_record_without_a_newline_is_refused(self):
+        # A3: `read` returns false for a final record with no newline, and the loop used to drop it - a record the
+        # hook could not read whole looked like no record at all. Even a valid one is refused now.
+        sha = self.git('rev-parse', 'HEAD')
+        r = self.push_raw('refs/heads/main %s refs/heads/main %s' % (sha, self.base))
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn('not terminated by a newline', r.stdout)
+
+    def test_a_malformed_last_record_without_a_newline_is_refused(self):
+        r = self.push_raw('refs/heads/main abc refs/heads/main')   # three fields, and no newline either
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn('not four fields', r.stdout)
+        self.assertIn('refusing to push', r.stdout)
+
+    def test_an_empty_record_is_refused(self):
+        # Empty input is refused before the loop (it looks like records that could not be captured); a blank
+        # record among records is malformed, and is refused rather than skipped.
+        r = self.push_raw('\n')
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn('empty record', r.stdout)
+
+    def test_a_valid_last_record_still_passes_with_its_newline(self):
+        self.commit('clean.txt', 'a clean change')
+        sha = self.git('rev-parse', 'HEAD')
+        r = self.push(('refs/heads/main', sha, 'refs/heads/main', self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('clean', r.stdout)
 
     def test_a_deleted_ref_publishes_nothing(self):
         r = self.push(('(delete)', ZERO, 'refs/heads/gone', self.base))

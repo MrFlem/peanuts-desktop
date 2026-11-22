@@ -13,6 +13,8 @@ Guarantees this class is responsible for, and the tests check:
   * the run slot is given back only once that whole group is gone: a survivor keeps it taken, so a second
     build can never start beside the previous one's children
   * exactly one Exited event, last, carrying the exit code and whether it was cancelled
+  * Exited is queued before exit_event, the wait handle and the run slot are published, so nothing can observe a
+    finished run whose terminal event it has not been given yet
   * nothing is ever queued after Exited: the queue is sealed with it, so a line the reader had in hand at that
     moment is dropped rather than shown after the run
   * the last line is in before Exited, or Exited says the pipe stayed open and the tail may be missing
@@ -251,11 +253,15 @@ class SupervisedProcess:
         event = Exited(code, self._cancelled, round(time.monotonic() - self._t0, 3),
                        output_complete=complete,
                        cleanup=note if gone else 'the process group was still alive after SIGKILL')
-        self.exit_event = event
-        if gone:
-            self._release()      # the slot is free before Exited is visible, so the window sees a settled state
+        # Exited is queued before anything can show that the run ended. A window that saw the slot free - or
+        # exit_event set - while the terminal event was still on its way could drop the run and lose that event,
+        # its status line and its button state. So the event goes in first, and only then are the run's state and
+        # the slot published: from here on, "not busy" and "has an exit_event" both mean Exited is already queued.
         self._emit(event, last=True)   # the last lifecycle event: the queue is sealed with it
+        self.exit_event = event
         self._exited.set()
+        if gone:
+            self._release()
         if not gone:
             # Fail closed. The slot stays taken until the group really is empty; if it never is, this process
             # cannot start another build, which is the safe end of the trade.

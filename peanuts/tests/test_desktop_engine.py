@@ -57,6 +57,25 @@ class ParkedLineReader(SupervisedProcess):
         super()._deliver(raw)
 
 
+class ReleaseWatcher(SupervisedProcess):
+    """Records what a window could observe at the moment the run slot came back.
+
+    B3's race was between publishing `exit_event` / freeing the slot and queueing Exited: a window polling
+    `busy()` could drop the run and never see its terminal event. Recording both at `_release()` makes the order
+    a fact of the run rather than a matter of timing.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.at_release = None
+
+    def _release(self):
+        if self._claimed:
+            queued = list(self._events.queue)
+            self.at_release = dict(exit_event=self.exit_event, last=queued[-1] if queued else None)
+        super()._release()
+
+
 class Markers(unittest.TestCase):
     def test_plain_line_is_one_info_event(self):
         events = parse_line('reading the game folder')
@@ -620,6 +639,16 @@ class ProcessGroupAndOutput(unittest.TestCase):
         self.assertIsInstance(events[-1], Exited, 'something was emitted after Exited')
         self.assertEqual(sum(1 for e in events if isinstance(e, Line) and e.text.startswith('line ')), n)
         self.assertTrue(exit_event.output_complete)
+
+    # --- B3: the terminal event is in the queue before the run looks finished --------------------
+    def test_the_run_slot_comes_back_only_after_exited_is_queued(self):
+        run = ReleaseWatcher(child('print("one", flush=True)'))
+        run.run(timeout=30)
+        self.assertIsNotNone(run.at_release, 'the run slot was never released')
+        self.assertIsNotNone(run.at_release['exit_event'], 'the slot came back with no exit event published')
+        self.assertIsInstance(run.at_release['last'], Exited,
+                              'the slot came back before Exited was queued: a window could drop the run')
+        self.assertIs(run.at_release['last'], run.at_release['exit_event'])
 
     # --- B1: the window may not exit over a running check ----------------------------------------
     def test_stop_and_wait_ends_the_group_before_it_reports_settled(self):

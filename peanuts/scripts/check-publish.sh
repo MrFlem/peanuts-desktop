@@ -63,8 +63,12 @@
 #     * a fixture deleted anywhere makes its entries stale, because each entry must still match exactly one line of,
 #       its file at the target; a file deleted with its fixture is reported the same way;
 #     * an entry removed by a later commit while its line remains is caught by the scan of that later version: the
-#       line is no longer exempt there, so it is reported;
-#     * one entry exempts one occurrence in each version, so a second copy of a listed line fails.
+#       line is no longer exempt there, so it is reported; a file no commit in this range touches is not read by
+#       that scan, so it is re-read at the target when an entry this range ever published is gone from it: a
+#       revocation cannot leave the content it used to cover exempt;
+#     * one entry exempts one occurrence in each version, so a second copy of a listed line fails;
+#     * every entry of the target's allowlist has to describe exactly one line of its file at the target, whether
+#       or not this range touches that file, so an entry the file no longer keeps is stale rather than dormant.
 #
 #   The report names a file, a line and a reason code, never the value: this output goes to terminals, logs and
 #   handoff reports. File paths are repository-relative, so they name nothing outside the repository.
@@ -212,26 +216,40 @@ changed_files() {   # <commit> <diff-filter> -> paths, one per line
 
 allow=peanuts/scripts/publish-allowlist.txt
 : > "$tmp.files"; : > "$tmp.gone"; : > "$tmp.hits"; : > "$tmp.seen"; : > "$tmp.ok"; : > "$tmp.entries"
-: > "$tmp.stale"; : > "$tmp.later"
+: > "$tmp.stale"; : > "$tmp.later"; : > "$tmp.allows"; : > "$tmp.everallow"; : > "$tmp.rescanned"
 
 # The exemptions are the ones published at <target-ref>, read from the object store, never the working tree: a
 # local edit to the allowlist must not change the verdict for the same --since/--target pair, and an exemption
 # must be published to count. A tree without the file has no exemptions; an object the gate cannot read is a
 # failure, because "no entries" and "could not look" must never be the same answer.
+# blob_at <ref> <path> <output file>: 0 when the file's bytes at <ref> were written to <output file>, 1 when the
+# path is not in that tree (there is nothing there, and nothing to check). It never returns otherwise: a git that
+# cannot inspect the tree, a path that is not a regular file and an object that cannot be read all fail the gate,
+# because "could not look" must not answer like "nothing there".
+blob_at() {
+	if ! found=$(git ls-tree "$1" -- "$2" 2>&1); then
+		die "cannot look up $2 at $1: git could not inspect that tree, so the gate cannot check it"
+	fi
+	[ -n "$found" ] || return 1
+	case $found in
+		*" blob "*) ;;
+		*) die "$2 at $1 is not a regular file: the gate cannot read it" ;;
+	esac
+	git cat-file blob "$1:$2" > "$3" 2>/dev/null \
+		|| die "cannot read $2 at $1: its object is missing, so the gate cannot check it"
+}
+
 allowlist_at() {   # <ref> <output file>: the allowlist as published at that commit
 	# The output goes to the file named here, never through the function's stdout: a die() inside a redirected
 	# function would put its own message in that file and leave the terminal with nothing.
-	if git cat-file -e "$1:$allow" 2>/dev/null; then
-		git cat-file blob "$1:$allow" > "$2" \
-			|| die "cannot read $allow at $1: its object is missing, so the gate cannot check its exemptions"
+	if blob_at "$1" "$allow" "$2"; then
 		return 0
 	fi
-	found=$(git ls-tree "$1" -- "$allow" 2>&1) \
-		|| die "cannot look up $allow at $1: the gate cannot check its exemptions"
-	[ -z "$found" ] || die "cannot read $allow at $1: the gate cannot check its exemptions"
-	: > "$2"
+	: > "$2"   # no allowlist in that commit: no exemptions
 }
 allowlist_at "$target" "$tmp.allow" || exit 1
+allowlist_at "$since" "$tmp.allows" || exit 1
+cat "$tmp.allows" >> "$tmp.everallow" || die "cannot read the baseline commit's allowlist"
 
 for c in $revs; do
 	changed_files "$c" 'ACMRT' > "$tmp.changed" \
@@ -254,7 +272,7 @@ done
 # Parsed by hand rather than with `read <path><TAB><line>`: IFS whitespace would strip a fixture line's leading or
 # trailing spaces, and a final entry without a newline would be lost. A CR, a second tab or a duplicate entry is a
 # broken promise and fails the gate.
-if [ -f "$allow" ]; then
+if [ -s "$tmp.allow" ]; then
 	n=0
 	while IFS= read -r entry || [ -n "$entry" ]; do
 		n=$((n + 1))
@@ -283,64 +301,102 @@ if [ -f "$allow" ]; then
 			echo "$allow: entry $n repeats an earlier entry for $p: one entry per fixture line"; fail=1; continue
 		fi
 		printf '%s\n' "$entry" >> "$tmp.entries"
-		# Only a file these commits touch needs its entry; an entry for an untouched file is not exercised here.
-		if grep -Fxq -- "$p" "$tmp.files" || grep -Fxq -- "$p" "$tmp.gone"; then
-			printf '%s\n' "$entry" >> "$tmp.ok"
-		fi
+		# Every entry is checked against its file at <target-ref>, whether or not this range touches that file:
+		# an entry the file no longer keeps is stale, and leaving it dormant is how a revoked one stayed silent.
+		printf '%s\n' "$entry" >> "$tmp.ok"
 	done < "$tmp.allow"
 fi
 
 # --- the scan: every changed file, at every commit that changed it ------------------------------
+# scan_file <commit> <path> <blob file> <allowlist file> <record-later 0|1>: one version of one file, checked
+# against that commit's exemptions. Every private-looking line the exemptions do not cover is a hit, and one entry
+# exempts one occurrence, so a second identical line in the same version is a hit as well. The report names the
+# commit, the file, the line and the reasons, never the value it found.
+scan_file() {
+	sf_c=$1
+	sf_f=$2
+	sf_blob=$3
+	sf_allowc=$4
+	sf_later=$5
+	: > "$tmp.seen"
+	grep -nIE -- "$PRIV" "$sf_blob" > "$tmp.grep"
+	case $? in
+		0 | 1) ;;
+		*) die "grep failed on $sf_f at commit $sf_c: the gate cannot finish" ;;
+	esac
+	while IFS= read -r hit; do
+		[ -n "$hit" ] || continue
+		lineno=${hit%%:*}
+		text=${hit#*:}
+		stripped=$(strip_loopback "$text") || die "sed failed on $sf_f at commit $sf_c"
+		printf '%s\n' "$stripped" | grep -qE -- "$PRIV"
+		case $? in
+			0) ;;
+			1) continue ;;   # only a loopback host's adb port on this line
+			*) die "grep failed on $sf_f at commit $sf_c: the gate cannot finish" ;;
+		esac
+		codes=$(reason_codes "$stripped"); codes=${codes%,}
+		[ -n "$codes" ] || codes=private
+		pair=$(printf '%s\t%s' "$sf_f" "$text")
+		if grep -Fxq -- "$pair" "$tmp.ok"; then
+			# One entry exempts one occurrence: a second identical line in the same version is not covered.
+			if grep -Fxq -- "$pair" "$tmp.seen"; then
+				printf '%s\t%s\t%s\t%s\n' "$sf_c" "$sf_f" "$lineno" "repeated,$codes" >> "$tmp.hits"
+				fail=1
+			else
+				printf '%s\n' "$pair" >> "$tmp.seen"
+				# The entry is published at <target-ref>; was it already there at this commit? If not, it was added later
+				# in the range. That still covers this exact line, but it is reported rather than silent: an entry that
+				# only appears after the line it exempts is a promise made afterwards.
+				if [ "$sf_later" = 1 ] && ! grep -Fxq -- "$pair" "$sf_allowc"; then
+					printf '%s\t%s\t%s\n' "$sf_c" "$sf_f" "$lineno" >> "$tmp.later"
+				fi
+			fi
+		else
+			printf '%s\t%s\t%s\t%s\n' "$sf_c" "$sf_f" "$lineno" "$codes" >> "$tmp.hits"
+			fail=1
+		fi
+	done < "$tmp.grep"
+}
+
 for c in $revs; do
 	changed_files "$c" 'ACMRT' > "$tmp.changed" \
 		|| die "git diff-tree $c failed: the gate cannot list what that commit changes"
 	allowlist_at "$c" "$tmp.allowc" || exit 1
+	cat "$tmp.allowc" >> "$tmp.everallow" || die "cannot read the allowlist of commit $c"
 	LC_ALL=C sort -u "$tmp.changed" > "$tmp.changed.u" || die "sort failed on $c's changed files"
 	while IFS= read -r f; do
 		[ -n "$f" ] || continue
 		git cat-file blob "$c:$f" > "$tmp.blob" 2>/dev/null \
 			|| die "cannot read $f at commit $c: its object is missing, so the gate cannot check it"
-		: > "$tmp.seen"
-		grep -nIE -- "$PRIV" "$tmp.blob" > "$tmp.grep"
-		case $? in
-			0 | 1) ;;
-			*) die "grep failed on $f at commit $c: the gate cannot finish" ;;
-		esac
-		while IFS= read -r hit; do
-			[ -n "$hit" ] || continue
-			lineno=${hit%%:*}
-			text=${hit#*:}
-			stripped=$(strip_loopback "$text") || die "sed failed on $f at commit $c"
-			printf '%s\n' "$stripped" | grep -qE -- "$PRIV"
-			case $? in
-				0) ;;
-				1) continue ;;   # only a loopback host's adb port on this line
-				*) die "grep failed on $f at commit $c: the gate cannot finish" ;;
-			esac
-			codes=$(reason_codes "$stripped"); codes=${codes%,}
-			[ -n "$codes" ] || codes=private
-			pair=$(printf '%s\t%s' "$f" "$text")
-			if grep -Fxq -- "$pair" "$tmp.ok"; then
-				# One entry exempts one occurrence: a second identical line in the same version is not covered.
-				if grep -Fxq -- "$pair" "$tmp.seen"; then
-					printf '%s\t%s\t%s\t%s\n' "$c" "$f" "$lineno" "repeated,$codes" >> "$tmp.hits"
-					fail=1
-				else
-					printf '%s\n' "$pair" >> "$tmp.seen"
-					# The entry is published at <target-ref>; was it already there at this commit? If not, it was
-					# added later in the range. That still covers this exact line, but it is reported rather than
-					# silent: an entry that only appears after the line it exempts is a promise made afterwards.
-					if ! grep -Fxq -- "$pair" "$tmp.allowc"; then
-						printf '%s\t%s\t%s\n' "$c" "$f" "$lineno" >> "$tmp.later"
-					fi
-				fi
-			else
-				printf '%s\t%s\t%s\t%s\n' "$c" "$f" "$lineno" "$codes" >> "$tmp.hits"
-				fail=1
-			fi
-		done < "$tmp.grep"
+		scan_file "$c" "$f" "$tmp.blob" "$tmp.allowc" 1
 	done < "$tmp.changed.u"
 done
+
+# --- an exemption this range revokes re-evaluates the content it used to cover -------------------
+# The loop above reads only the files these commits change. A fixture committed before the range is not read again,
+# so a private-looking line in it is covered by whatever entry the target publishes - and an entry this range
+# removes would otherwise leave that line published without an exemption at all, which no commit here would show.
+# Every entry this range ever published (at the baseline and at each commit in it) that the target no longer has is
+# therefore checked against the content as published at the target, with the target's own exemptions: the content
+# it used to cover is re-evaluated, while retained content whose entry is still there stays exempt.
+if [ -s "$tmp.everallow" ]; then
+	LC_ALL=C sort -u "$tmp.everallow" > "$tmp.everallow.u" \
+		|| die 'sort failed on the allowlist entries of this range'
+	: > "$tmp.rescanned"
+	while IFS= read -r entry; do
+		case $entry in '' | '#'*) continue ;; esac
+		grep -Fxq -- "$entry" "$tmp.allow" && continue   # still exempt at the target
+		p=${entry%%"$tab"*}
+		[ "$p" = "$entry" ] && continue                  # not an entry; the target's own parse reports a broken one
+		grep -Fxq -- "$p" "$tmp.files" && continue        # changed in the range: already read at the target
+		grep -Fxq -- "$p" "$tmp.gone" && continue
+		grep -Fxq -- "$p" "$tmp.rescanned" && continue
+		printf '%s\n' "$p" >> "$tmp.rescanned"
+		blob_at "$target" "$p" "$tmp.blob" || continue    # not published at the target: nothing retained
+		scan_file "$target" "$p" "$tmp.blob" "$tmp.allow" 0
+	done < "$tmp.everallow.u"
+fi
 
 # --- what is wrong, by file, line and reason (never the value) ----------------------------------
 if [ -s "$tmp.hits" ]; then
@@ -362,15 +418,13 @@ if [ -s "$tmp.ok" ]; then
 	while IFS= read -r entry; do
 		p=${entry%%"$tab"*}
 		line=${entry#*"$tab"}
-		if ! git cat-file -e "$target:$p" 2>/dev/null; then
+		if ! blob_at "$target" "$p" "$tmp.blob"; then
 			if ! grep -Fxq -- "$p" "$tmp.stale"; then
-				echo "stale publish-allowlist entry: $p is deleted by these commits, so its entries are dead: remove them with the fixture"
+				echo "stale publish-allowlist entry: $p is not in the target commit, so its entries are dead: remove them with the fixture"
 				printf '%s\n' "$p" >> "$tmp.stale"
 			fi
 			fail=1; continue
 		fi
-		git cat-file blob "$target:$p" > "$tmp.blob" 2>/dev/null \
-			|| die "cannot read $p at $target: its object is missing, so the gate cannot check its entry"
 		count=$(grep -cxF -- "$line" "$tmp.blob")
 		case $? in
 			0 | 1) ;;

@@ -80,17 +80,34 @@ The Plan, Preflight and Log panes are read-only rather than `disabled`, so they 
 can be scrolled, selected and copied (`Ctrl+C`; `Ctrl+A` selects the pane). `Tab` and `Shift+Tab` move the focus
 between widgets and never type a tab into a pane; `Alt+P`, `Alt+K` and `Alt+L` put the focus on the Plan, Preflight
 and Log pane. The window's own shortcuts (`Ctrl+O`, `Ctrl+D`, `F5`, `Esc`) keep working while a pane has the focus:
-that rule is `ui/keys.py`, so it is checked without a display. The log follows new output only while it is scrolled
-to the bottom, so reading earlier lines is not interrupted.
+that rule is `ui/keys.py`, so it is checked without a display.
+
+`Ctrl+O` and `Ctrl+D` need care, because Tk's Text class binds both to an edit (open a line, delete a character) and
+a class binding runs after the pane's own. The pane therefore runs the window's picker itself and answers `break`,
+which stops the class binding; cut, paste, undo and middle-click are stopped the same way. The panes stay
+immutable, and `PaneBindings` in the tests drives a real `Text` with those keys and events on a machine with a
+display. The log follows new output only while it is scrolled to the bottom, so reading earlier lines is not
+interrupted.
 
 Closing the window during a check asks first, then stops the run and waits - bounded - for its whole process group
 to be gone before the window goes away. `Exited` is not the end of the run: the supervisor ends what the tool
-started afterwards, so the window keeps the run until it reports settled (`ui/lifecycle.py`) and will not close
-over it. A group that cannot be confirmed gone is sent `SIGKILL` and named on stderr, rather than left behind by a
-window that closed over it.
+started afterwards and queues `Exited` before it frees the run slot, and the window keeps the run until that event
+has been handled *and* the supervisor reports it settled (`ui/lifecycle.py`). It will not close over it, and it will
+not drop it early either - the slot can come back before the window has read the queue, so "the slot is free" alone
+is not the end. A group that cannot be confirmed gone is sent `SIGKILL` and named on stderr, rather than left behind
+by a window that closed over it.
 
 ## Security
 
+- **What a screenshot can show.** The path box, the `Input` label and the Plan pane deliberately show the input you
+  chose and the exact command that would run, including the paths in it (in `Phase B`, the `prod.keys` path). They
+  are local, not a log, and they are not redacted: read them before sharing a screenshot or a copied plan. Everything
+  the tools print - the log, the status line, the progress text - is redacted, and so is a reader's error sentence
+  (see below). The redaction still shortens the *error's* paths, not the ones you picked.
+- A failure to read an input is a sentence from the reader, not the log: `classify()` keeps it in `InputInfo.error`
+  and `model/inputs.diagnostic()` redacts it before it reaches the `Input` label or the Plan pane's blocker, so a
+  home folder or a registered serial in an error cannot be photographed by accident. A message box gets the same
+  treatment (`ui/app.py`), because a spawn error quotes the command it could not run.
 - The window never reads `prod.keys`; it only passes a path to the importer (`Phase B`). Nothing about the file's
   contents is displayed, logged or stored.
 - Every event passes through `engine/redact.py` before it reaches the window, not only a `Line`: a `progress`
@@ -116,9 +133,12 @@ python peanuts/tests/test_desktop_model.py      # classification, the run plan, 
 
 The keyboard rules and the run lifecycle are checked by running them (`ui/keys.py` and `ui/lifecycle.py` import no
 Tk, so `Keyboard` and `RunLifecycle` in `test_desktop_model.py` exercise the real functions), and the rest of the
-window's structure is read from its source (`WindowStructure`). This machine and CI have no display, so no pane was
-rendered, focused, typed into, scrolled or copied from in a test, and no GUI behaviour is claimed from those checks.
-The device plan for what they cannot cover is in the WO-020-SEC R2 report.
+window's structure is read from its source (`WindowStructure`). `PaneBindings` additionally drives a real Tk `Text`
+with `read_only()`'s bindings - `Ctrl+O`, `Ctrl+D`, typing, paste, cut, undo, middle-click, selection, `Tab` - but
+it skips itself when there is no tkinter or no display, which is the case on this machine and in CI. So no pane was
+rendered, focused, typed into, scrolled or copied from *here*, and no GUI behaviour is claimed from the checks that
+ran: the device/UI pass, and what it must cover, are still pending. `test_desktop_engine.py` covers the supervisor's
+side of the same lifecycle against real child processes.
 
 Both run in CI through `.github/workflows/peanuts.yml`, which runs every `peanuts/tests/test_*.py` on Python 3.14
 with no display.

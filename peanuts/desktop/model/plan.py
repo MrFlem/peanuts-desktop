@@ -15,7 +15,7 @@ import sys
 from dataclasses import dataclass
 
 from .. import repo_root
-from .inputs import Kind, InputInfo
+from .inputs import Kind, InputInfo, diagnostic
 
 BUILD_SCRIPT = 'peanuts/scripts/peanuts_build.py'
 PACK_SCRIPT = 'scripts/pack_android.py'
@@ -67,7 +67,9 @@ def plan_for(info: InputInfo, keys=None, update=None):
     notes = []
 
     if not info.usable:
-        return RunPlan(blockers=(info.error or 'that input cannot be built',), notes=())
+        # The blocker is a reader's error: it is shown in the Plan pane, so it gets the same redaction as the log.
+        # It is a plan's only blocker, so there is no path of the user's own in it to lose.
+        return RunPlan(blockers=(diagnostic(info.error) if info.error else 'that input cannot be built',), notes=())
 
     if info.needs_keys and not keys:
         blockers.append('this input must be imported first, and importing needs your own prod.keys')

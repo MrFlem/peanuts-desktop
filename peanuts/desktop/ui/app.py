@@ -11,8 +11,11 @@ never implies a capability it does not have.
 Keyboard: the Plan, Preflight and Log panes are read-only rather than `disabled`, so they can hold the focus and
 their text can be scrolled, selected and copied. Tab and Shift+Tab move the focus between widgets (they never type
 a tab into a pane), and Alt+P, Alt+K and Alt+L put the focus on each pane; the window's own shortcuts (Ctrl+O,
-Ctrl+D, F5, Esc) still work while a pane has it. That rule is ui/keys.py, kept out of this file so it is checked on
-a machine with no display. The log follows new output only while it is scrolled to the bottom.
+Ctrl+D, F5, Esc) still work while a pane has it. Ctrl+O and Ctrl+D are the case that needs care: Tk's Text class
+binds both to an edit, and a class binding runs after the pane's own, so `read_only()` runs the window's action
+itself and answers 'break' rather than passing the key on. The panes also stop cut, paste, undo and middle-click,
+which the Text class binds too. The rule itself is ui/keys.py, kept out of this file so it is checked on a machine
+with no display. The log follows new output only while it is scrolled to the bottom.
 
 Closing: the window does not exit over a run whose processes may still be alive. Exited is not the end of the run:
 the supervisor ends what the tool started afterwards, so the run is kept until it is settled, and a window that is
@@ -20,8 +23,11 @@ closing asks (ui/lifecycle.py), then waits - bounded, on a worker thread so the 
 whole process group to be gone; a group that cannot be confirmed gone is sent SIGKILL and reported on stderr.
 
 Redaction: every line, progress label, stage line and pack path the supervisor emits is redacted before it reaches
-this file (engine.redact_event). The About and Plan panes show the path the user chose, which is locally useful and
-not a log; an error message shown there passes through the same redaction.
+this file (engine.redact_event). The path box, the About label and the Plan pane show the input the user chose and
+the exact command that would run: that is locally useful and not a log, and desktop/README.md says so before a
+screenshot is shared. A reader's error sentence is different - it can name a folder the user did not choose, or a
+serial - so it is presented through model.inputs.diagnostic(), which applies the log's own redaction, and a message
+box gets the same treatment here.
 
 Threading rules, which matter more than the layout:
   * Tk is touched only on the main thread. Work happens in worker threads and arrives through `self.ui_queue`,
@@ -59,6 +65,17 @@ def _refuse_edit(event):
     return 'break' if keys.refuse_edit(event.keysym, event.state) else None
 
 
+def _run_shortcut(run, _event=None):
+    """Run one of the window's Ctrl shortcuts from a focused pane, then stop the key.
+
+    Tk's Text class binds Ctrl+O (open a line) and Ctrl+D (delete a character), and a class binding runs after the
+    widget's own: passing either key through would edit a pane the user only meant to focus, before the window's
+    own shortcut ran. Running the action here and answering 'break' keeps the shortcut and stops the edit.
+    """
+    run()
+    return 'break'
+
+
 def _move_focus(step, event):
     """Tab and Shift+Tab: move the keyboard focus, and never type a tab into the pane."""
     widget = event.widget
@@ -68,13 +85,24 @@ def _move_focus(step, event):
     return 'break'
 
 
-def read_only(text):
-    """A Text pane that takes the keyboard focus, scrolls and copies, and refuses every edit."""
+def read_only(text, shortcuts=None):
+    """A Text pane that takes the keyboard focus, scrolls and copies, and refuses every edit.
+
+    `shortcuts` maps the window's Ctrl keys ('o', 'd') to the window's own callables. Each is bound on the pane
+    itself, which runs it and stops the key: the Text class binds the same keys to edits, and a class binding runs
+    after the widget's, so passing them through is exactly what must not happen.
+    """
     text.configure(takefocus=True, highlightthickness=2, highlightbackground='#c8c8c8', highlightcolor='#2c7fb8')
     text.bind('<Key>', _refuse_edit)
     for sequence, keysym in (('<Tab>', 'Tab'), ('<Shift-Tab>', 'Shift-Tab'), ('<ISO_Left_Tab>', 'ISO_Left_Tab')):
         text.bind(sequence, lambda event, s=keys.focus_step(keysym): _move_focus(s, event))
-    for sequence in ('<<Cut>>', '<<Paste>>', '<<Clear>>', '<Button-2>'):
+    for name, run in dict(shortcuts or {}).items():
+        for sequence in (f'<Control-{name}>', f'<Control-{name.upper()}>'):
+            text.bind(sequence, lambda event, action=run: _run_shortcut(action, event))
+    # Every remaining way Tk's Text class would write into the pane: the clipboard, the primary selection and
+    # undo. The widget binding runs first, and 'break' stops the class from doing it.
+    for sequence in ('<<Cut>>', '<<Paste>>', '<<Clear>>', '<<Undo>>', '<<Redo>>', '<<PasteSelection>>',
+                     '<Button-2>'):
         text.bind(sequence, lambda _e: 'break')
     return text
 
@@ -87,6 +115,7 @@ class App:
         self.selection = LatestSelection()   # which classification request is the current one
         self.current = None
         self._quitting = None                # the run the window is waiting for before it closes
+        self._exit_seen = None               # the run whose Exited event this window has handled
         root.title(f'{TITLE} {__version__} (Phase A)')
         root.minsize(760, 620)
         self._build()
@@ -124,13 +153,14 @@ class App:
         plan_box = ttk.LabelFrame(root, text='Plan', padding=8)
         plan_box.grid(row=2, column=0, sticky='ew', padx=10, pady=(8, 0))
         plan_box.columnconfigure(0, weight=1)
-        self.plan = read_only(tk.Text(plan_box, height=6, wrap='word', font='TkFixedFont'))
+        self.plan = read_only(tk.Text(plan_box, height=6, wrap='word', font='TkFixedFont'), self._pane_shortcuts())
         self.plan.grid(row=0, column=0, sticky='ew')
 
         pc = ttk.LabelFrame(root, text='Preflight', padding=8)
         pc.grid(row=3, column=0, sticky='ew', padx=10, pady=8)
         pc.columnconfigure(0, weight=1)
-        self.checks = read_only(tk.Text(pc, height=4, wrap='word', font='TkFixedFont'))
+        self.checks = read_only(tk.Text(pc, height=4, wrap='word', font='TkFixedFont'),
+                                self._pane_shortcuts())
         self.checks.grid(row=0, column=0, sticky='ew')
         bar = ttk.Frame(pc)
         bar.grid(row=1, column=0, sticky='ew', pady=(6, 0))
@@ -148,7 +178,7 @@ class App:
         log_box.grid(row=4, column=0, sticky='nsew', padx=10)
         log_box.columnconfigure(0, weight=1)
         log_box.rowconfigure(0, weight=1)
-        self.log = read_only(tk.Text(log_box, height=14, wrap='word', font='TkFixedFont'))
+        self.log = read_only(tk.Text(log_box, height=14, wrap='word', font='TkFixedFont'), self._pane_shortcuts())
         scroll = ttk.Scrollbar(log_box, command=self.log.yview)
         self.log.configure(yscrollcommand=scroll.set)
         self.log.grid(row=0, column=0, sticky='nsew')
@@ -168,6 +198,10 @@ class App:
         for key, pane in (('p', self.plan), ('k', self.checks), ('l', self.log)):
             self.root.bind(f'<Alt-{key}>', lambda _e, w=pane: self.focus_pane(w))
         self.root.protocol('WM_DELETE_WINDOW', self.close)
+
+    def _pane_shortcuts(self):
+        """Ctrl+O and Ctrl+D as each pane runs them: the pane stops the key after the action (read_only)."""
+        return {'o': self.pick_file, 'd': self.pick_dir}
 
     def focus_pane(self, pane):
         """Put the keyboard focus on one of the three panes, where its text can be read, scrolled and copied."""
@@ -209,14 +243,18 @@ class App:
             return
         script = repo_root() / 'scripts' / 'bananative_env.py'
         if not script.is_file():
-            messagebox.showerror(TITLE, f'{script} is missing: is this the repository root?')
+            # A message box is shown outside the window, so it gets the same redaction as a log line: the
+            # repository can live under the user's home folder, and this sentence names it.
+            messagebox.showerror(TITLE, redact(f'{script} is missing: is this the repository root?'))
             return
         try:
             self.proc = SupervisedProcess(python_argv(script)).start()
         except (AlreadyRunning, SpawnError) as e:
             self.proc = None
-            messagebox.showerror(TITLE, str(e))
+            # A spawn error quotes the argv it could not run, which can name a home folder.
+            messagebox.showerror(TITLE, redact(str(e)))
             return
+        self._exit_seen = None   # a new run's terminal event has not been seen yet
         self.progress.configure(mode='indeterminate')
         self.progress.start(15)
         self.stage.configure(text='Checking the packer environment…')
@@ -254,8 +292,9 @@ class App:
             self.check_btn.configure(state='disabled' if SupervisedProcess.busy() else 'normal')
             self.stop_btn.configure(state='disabled')
             # The run is kept here on purpose: Exited says the tool ended, not that the processes it started are
-            # gone (the supervisor ends the rest of its process group afterwards). _pump lets it go once it is
-            # finished, and nothing may close the window over it before that.
+            # gone (the supervisor ends the rest of its process group afterwards). _pump records that this run's
+            # terminal event has been handled and lets it go once it is finished; nothing may close the window over
+            # it before that, and it may not be dropped before this event has been processed.
 
     def _pump(self):
         try:
@@ -277,7 +316,11 @@ class App:
         if run is not None:
             for event in run.drain():
                 self.handle(event)
-            if lifecycle.finished(run, SupervisedProcess.busy()):
+                if isinstance(event, Exited):
+                    # Delivered and processed. Only now may the run be dropped: the supervisor frees its slot
+                    # before this loop runs, so "not busy" on its own said nothing about this event.
+                    self._exit_seen = run
+            if lifecycle.finished(run, SupervisedProcess.busy(), self._exit_seen is run):
                 self.proc = None
                 if self._quitting is None:
                     self.check_btn.configure(state='normal')
@@ -286,6 +329,8 @@ class App:
     # --- what the panes say ---------------------------------------------------------------------
     def show_input(self, info):
         self.current = info
+        # summary() redacts a reader's own error sentence (model/inputs.py: diagnostic), so the About label never
+        # shows a folder that came out of a failure rather than out of the path the user picked.
         self.set_about(summary(info))
         plan = plan_for(info)
         lines = []
