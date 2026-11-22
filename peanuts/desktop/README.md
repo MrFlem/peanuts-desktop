@@ -74,13 +74,25 @@ output changes, `engine/markers.py` changes with it.
 | `done: <path> (<n> MiB); …` | the pack is complete; `<path>` is authoritative |
 | `[RED] …` | something wrong; the exit code says whether it was fatal |
 
+## Keyboard and closing
+
+The Plan, Preflight and Log panes are read-only rather than `disabled`, so `Tab` reaches them and their text can be
+scrolled, selected and copied (`Ctrl+C`; `Ctrl+A` selects the pane). `Alt+P`, `Alt+K` and `Alt+L` put the focus on
+the Plan, Preflight and Log pane. The log follows new output only while it is scrolled to the bottom, so reading
+earlier lines is not interrupted.
+
+Closing the window during a check asks first, then stops the run and waits - bounded - for its whole process group
+to be gone before the window goes away. A group that cannot be confirmed gone is sent `SIGKILL` and named on
+stderr, rather than left behind by a window that closed over it.
+
 ## Security
 
 - The window never reads `prod.keys`; it only passes a path to the importer (`Phase B`). Nothing about the file's
   contents is displayed, logged or stored.
 - Every line passes through `engine/redact.py` before it reaches the log pane or a screenshot, including the
-  `$ <command>` line the window prints itself: home folders become `~` or `<user>`. Do not disable it to debug
-  something that will be shared.
+  `$ <command>` line the window prints itself and the pack path a `done:` line carries: home folders become `~` or
+  `<user>`. The shortened path still opens locally, so the pane stays useful while what you copy out of it is what
+  is safe to share. Do not disable it to debug something that will be shared.
 - Device serials become `[REDACTED_DEVICE_SERIAL]` once registered with `engine/redact.protect_serial()`. Only a
   registered serial is matched — never every long alphanumeric string, which would hide title IDs and versions —
   and registering one never prints it. Phase A registers none; the transfer step (Phase D) registers the serials
@@ -95,6 +107,11 @@ output changes, `engine/markers.py` changes with it.
 python peanuts/tests/test_desktop_engine.py     # markers, redaction, real child processes, cancel, one-at-a-time
 python peanuts/tests/test_desktop_model.py      # classification, the run plan, the no-tkinter rule
 ```
+
+The window's keyboard panes, log following and closing are checked by reading its source
+(`test_desktop_model.py`, `WindowStructure`): this machine and CI have no display, so no pane was rendered, focused
+or scrolled in a test, and no GUI behaviour is claimed from those checks. The device plan for what they cannot cover
+is in the WO-020-SEC report.
 
 Both run in CI through `.github/workflows/peanuts.yml`, which runs every `peanuts/tests/test_*.py` on Python 3.14
 with no display.

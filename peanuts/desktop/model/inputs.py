@@ -22,6 +22,14 @@ from .. import repo_root
 # The file types the importer reads (peanuts/scripts/peanuts_build.py: GAME_EXTS).
 GAME_EXTS = ('.nsp', '.xci', '.nsz', '.xcz')
 
+
+def visible(name):
+    """The builder's own rule (peanuts_build.py: visible()): macOS leaves an AppleDouble file beside each file it
+    touches on an exFAT or FAT drive, and `._Game.nsp` is metadata, not the game. A folder of game files already
+    skips them here; a file picked on its own is refused with the same reason instead of being offered for a build
+    the builder would then fail on."""
+    return not str(name).startswith('._')
+
 _TOOLS = None
 
 
@@ -135,6 +143,10 @@ def classify(path):
         if suffix == '.nup':
             return _scanned(p, Kind.NUP)
         if suffix in GAME_EXTS:
+            if not visible(p.name):
+                return InputInfo(p, Kind.UNKNOWN,
+                                 error=f'{p.name} is macOS metadata (an AppleDouble file) beside a game file, not '
+                                       f'the game file: the builder skips it too. Choose {p.name[2:]!r} instead')
             return InputInfo(p, Kind.FILE)
         return InputInfo(p, Kind.UNKNOWN,
                          error=f'{p.name} is not a game file this builder reads (.nsp, .xci, .nsz, .xcz, .nup)')
@@ -143,7 +155,7 @@ def classify(path):
         if tools().pack_dump.is_dump(p):
             return _scanned(p, Kind.DUMP)
         found = tuple(sorted(f for f in p.iterdir()
-                             if f.is_file() and f.suffix.lower() in GAME_EXTS and not f.name.startswith('._')))
+                             if f.is_file() and f.suffix.lower() in GAME_EXTS and visible(f.name)))
     except Exception as e:   # an unreadable folder becomes a sentence, never a traceback in the window
         return InputInfo(p, Kind.UNKNOWN, error=f'{p}: {e}')
     if found:

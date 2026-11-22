@@ -109,7 +109,9 @@ this project has touched, and which edits are marked / queued for a Banana Nativ
   an AI tool or vendor, and never commit as an AI identity. The commit author is the owner's identity only.
 - **No private data:** no LAN or adb addresses, home or mount paths, work-folder paths, or personal e-mails in any
   committed file or message; use placeholders (`<work dir>`, `<device ip>`).
-- `sh peanuts/scripts/check-publish.sh` must print "clean" before any push.
+- `sh peanuts/scripts/check-publish.sh` must print "clean" before any push. It reads the commits being published
+  (never the working tree), and the `pre-push` hook gives it each pushed ref's own range; CONTRIBUTING.md
+  "Publishing rules" says what it finds and what it cannot.
 
 ## Where findings go
 

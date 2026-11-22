@@ -153,6 +153,19 @@ class Supervision(unittest.TestCase):
             SupervisedProcess(['/nonexistent/peanuts-test-program']).start()
         self.assertFalse(SupervisedProcess.busy())
 
+    def test_an_argument_the_os_cannot_pass_is_refused_and_frees_the_slot(self):
+        # Popen raises ValueError (not OSError) for a NUL, after the slot has been taken: the supervisor used to stay
+        # busy for the life of the window, and no run could ever start again.
+        with self.assertRaises(SpawnError):
+            SupervisedProcess(child('pass') + ['bad' + chr(0) + 'arg']).start()
+        self.assertFalse(SupervisedProcess.busy())
+
+    def test_an_unusable_environment_is_refused_and_frees_the_slot(self):
+        # The same failure one layer down: Popen raises TypeError for an env value that is not a string.
+        with self.assertRaises(SpawnError):
+            SupervisedProcess(child('pass'), env={'NOT_A_STRING': 1}).start()
+        self.assertFalse(SupervisedProcess.busy())
+
     def test_it_reads_the_markers_of_a_real_child(self):
         run = SupervisedProcess(child(CHILD_MARKERS))
         exit_event = run.run(timeout=30)
@@ -180,6 +193,15 @@ class Supervision(unittest.TestCase):
         run.run(timeout=30)
         lines = [e.text for e in run.drain() if isinstance(e, Line)]
         self.assertTrue(any('~/games/x' in text for text in lines), lines)
+
+    def test_a_done_path_is_redacted_too(self):
+        # The pack path a Done carries is what the window offers to open and a report quotes: same treatment.
+        home = '/home/' + 'alice'
+        run = SupervisedProcess(child('print("done: ' + home + '/games/x (12.3 MiB)", flush=True)'), home=home)
+        run.run(timeout=30)
+        dones = [e for e in run.drain() if isinstance(e, Done)]
+        self.assertTrue(dones, 'the run emitted no Done event')
+        self.assertEqual(dones[0].path, '~/games/x')
 
     def test_the_command_echo_line_is_redacted_too(self):
         # The echo names the argv, and the argv can carry a keys path or an output folder under the home folder.
@@ -544,6 +566,43 @@ class ProcessGroupAndOutput(unittest.TestCase):
         self.assertIsInstance(events[-1], Exited, 'something was emitted after Exited')
         self.assertEqual(sum(1 for e in events if isinstance(e, Line) and e.text.startswith('line ')), n)
         self.assertTrue(exit_event.output_complete)
+
+    # --- B1: the window may not exit over a running check ----------------------------------------
+    def test_stop_and_wait_ends_the_group_before_it_reports_settled(self):
+        # A child that ignores SIGTERM: stop() alone only asks, and its escalation lives on a thread of a process
+        # that is about to end. stop_and_wait() must end it, in the caller's thread, within its own bound.
+        run = SupervisedProcess(child('import signal, time\n'
+                                      'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+                                      'print("ready", flush=True)\n'
+                                      'time.sleep(120)'), group_grace=1.0)
+        run.start()
+        ready = False
+        deadline = time.monotonic() + 15
+        while not ready and time.monotonic() < deadline:
+            ready = any(isinstance(e, Line) and 'ready' in e.text for e in run.drain(timeout=0.2))
+        self.assertTrue(ready, 'the child never started')
+        started = time.monotonic()
+        self.assertTrue(run.stop_and_wait(grace=0.5, timeout=15), 'the run never settled')
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertTrue(run.settled())
+        self.assertTrue(run.exit_event.cancelled, 'the run was not reported as stopped')
+        self.assertFalse(SupervisedProcess.busy(), 'the slot was never given back')
+
+    def test_stop_and_wait_is_bounded_when_the_group_cannot_be_confirmed_gone(self):
+        run = SupervisedProcess(child('pass'))
+        run.start()
+        with mock.patch.object(SupervisedProcess, 'settled', return_value=False):
+            started = time.monotonic()
+            self.assertFalse(run.stop_and_wait(grace=0.1, timeout=0.5), 'an unconfirmable group was reported gone')
+            self.assertLess(time.monotonic() - started, 5.0, 'stop_and_wait outlived its own timeout')
+        self.assertTrue(run.wait(15), 'the run did not finish on its own')
+
+    def test_stop_and_wait_on_a_finished_run_is_true_at_once(self):
+        run = SupervisedProcess(child('print("hi", flush=True)'))
+        run.run(timeout=30)
+        started = time.monotonic()
+        self.assertTrue(run.stop_and_wait())
+        self.assertLess(time.monotonic() - started, 2.0)
 
     def test_a_descendant_in_the_group_holding_the_pipe_is_ended_and_output_is_complete(self):
         # The parent starts a child that inherits stdout, then exits at once: the pipe stays open, so the reader

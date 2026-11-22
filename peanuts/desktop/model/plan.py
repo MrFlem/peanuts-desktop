@@ -10,6 +10,7 @@ keeps them apart on purpose.
 """
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 
@@ -47,6 +48,19 @@ def _rel(script):
     return str(repo_root() / script)
 
 
+def argument(path):
+    """A path in the form the builder's own argument parser reads it.
+
+    peanuts_build.py and pack_android.py take the input as a positional argument, and argparse reads a word that
+    starts with '-' as an option: the builder refuses '-Game.nsp' as an unknown option and never sees the file.
+    './-Game.nsp' is the same file and an unambiguous argument, which is what the builder accepts; every other path,
+    absolute ones included, is passed unchanged. A file dialog always yields an absolute path, so this matters for a
+    path typed on the command line or pasted into a launch, and it keeps the plan's argv equal to what runs.
+    """
+    s = str(path)
+    return os.path.join('.', s) if s.startswith('-') else s
+
+
 def plan_for(info: InputInfo, keys=None, update=None):
     """The plan for one input. `keys` is a path chosen locally; nothing here reads that file."""
     blockers = []
@@ -63,18 +77,18 @@ def plan_for(info: InputInfo, keys=None, update=None):
 
     if info.kind in (Kind.FILE, Kind.GAMES):
         sources = info.files if info.kind is Kind.GAMES else (info.path,)
-        argv = [sys.executable, _rel(BUILD_SCRIPT), *[str(p) for p in sources]]
-        argv += ['--keys', keys or '<your prod.keys>']
+        argv = [sys.executable, _rel(BUILD_SCRIPT), *[argument(p) for p in sources]]
+        argv += ['--keys', argument(keys) if keys else '<your prod.keys>']
         if update is not None:
-            argv += ['--update', str(update)]
+            argv += ['--update', argument(update)]
         steps = (Step('Import and build',
                       tuple(argv),
                       'Imports the game files into a .nup, then builds the pack from it. Needs prod.keys, a C '
                       'compiler and cmake for the importer.'),)
     else:
-        argv = [sys.executable, _rel(PACK_SCRIPT), str(info.path)]
+        argv = [sys.executable, _rel(PACK_SCRIPT), argument(info.path)]
         if info.kind is Kind.DUMP and update is not None:
-            argv += ['--version', str(update)]
+            argv += ['--version', argument(update)]
         steps = (Step('Build the pack',
                       tuple(argv),
                       'Rewrites the game code for Android and builds the shader library. No keys are needed for '

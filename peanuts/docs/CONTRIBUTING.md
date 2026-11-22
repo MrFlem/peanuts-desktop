@@ -220,6 +220,16 @@ If you hit this symptom on a new title, look for it before assuming the pack is 
 - **No private data in a committed file.** No LAN addresses, no adb-over-network addresses, no home or mount paths
   (your home folder, your mount points, Windows user folders), no assistant work folders, no personal e-mail addresses, no hostnames
   of your own machines. Use placeholders: `<work dir>`, `<your dump folder>`, `<device ip>`.
+- **What the gate reads.** `check-publish.sh` reads the commits the push publishes, never the files on disk: every
+  commit in the range, and each file as that commit had it, so a value one commit added and a later one removed is
+  still found. The `pre-push` hook hands it the range of each ref it is about to publish (a fast-forward's added
+  commits; the whole branch for a new one or a non-fast-forward push), so the gate never assumes that `HEAD` is what
+  is being pushed. Every git command it runs is checked: a failure fails the gate, it never produces a clean one.
+- **What the gate cannot do.** It is a regular-expression scan of text: the shapes are listed at the top of
+  `check-publish.sh` (LAN and adb addresses, home and mount paths, assistant work folders, personal e-mail
+  addresses, a private-key header, and the common AWS, GitHub, Google, Slack and Stripe token formats). A binary
+  file is skipped, a value in an unusual shape or a plain number is not found, and no scan can show that a change
+  holds no secret. Read the diff as well.
 - **The public history starts at the import.** Banana Native's history before the fork point stays upstream; the
   public repository begins with one commit that imports Banana Native at that point (crediting it, its license and
   its authors in the message and in the README), followed by Peanuts' own commits.

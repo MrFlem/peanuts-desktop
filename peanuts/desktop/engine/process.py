@@ -16,7 +16,11 @@ Guarantees this class is responsible for, and the tests check:
   * nothing is ever queued after Exited: the queue is sealed with it, so a line the reader had in hand at that
     moment is dropped rather than shown after the run
   * the last line is in before Exited, or Exited says the pipe stayed open and the tail may be missing
-  * every line redacted before it leaves this object
+  * every line, and every path an event carries, redacted before it leaves this object
+  * a start that fails frees the slot: an invalid argument is refused as SpawnError, never left holding it
+  * stop() only asks, and its escalation runs on its own thread; a window that is about to exit calls
+    stop_and_wait() instead, which does the bounded wait and the SIGKILL escalation on the caller's thread, because
+    a thread of a process that is ending cannot be relied on to finish the cleanup
 
 The queue is the supported interface: a callback runs on its own dispatcher thread, in the queue's order, and must
 not touch Tk directly.
@@ -34,7 +38,7 @@ import sys
 import threading
 import time
 
-from .events import ECHO, RED, Exited, Line
+from .events import ECHO, RED, Done, Exited, Line
 from .markers import parse_line
 from .redact import redact
 
@@ -123,6 +127,9 @@ class SupervisedProcess:
         bad = [a for a in argv if not isinstance(a, str) or not a]
         if bad:
             raise SpawnError(f'argv has an empty or non-string argument: {bad!r}')
+        if any('\0' in a for a in argv):
+            # Popen raises ValueError for it, after the slot has been taken: refuse it here, where nothing is held.
+            raise SpawnError('argv has a NUL in an argument: an argument cannot contain one')
 
     # --- lifecycle ------------------------------------------------------------------------------
     def start(self):
@@ -150,7 +157,10 @@ class SupervisedProcess:
                 # (os.getpgid) after the start fails for a parent that has already exited, and the group would then
                 # be taken for gone while the child it started was still running.
                 self._pgid = self._proc.pid
-        except OSError as e:
+        except (OSError, ValueError, TypeError) as e:
+            # ValueError (a NUL the check above did not see, an environment value that is not a string) and
+            # TypeError (an unusable env) are raised after the slot is taken, exactly like OSError: free it, or the
+            # supervisor stays busy for the life of the window and no run can ever start.
             self._release()
             raise SpawnError(f'cannot run {self.argv[0]}: {e}') from None
         self._t0 = time.monotonic()
@@ -216,6 +226,10 @@ class SupervisedProcess:
         for event in parse_line(raw):
             if isinstance(event, Line) and self.redact_output:
                 event = Line(redact(event.text, self.home), event.severity)
+            elif isinstance(event, Done) and self.redact_output:
+                # A Done's path is the pack folder the window offers to open and a report quotes: the same
+                # treatment as the line it was read from, so the path a reader sees names no home folder.
+                event = Done(redact(event.path, self.home), event.detail)
             self._emit(event)
 
     @staticmethod
@@ -390,6 +404,44 @@ class SupervisedProcess:
             return
         self._emit(Line(f'did not stop after {grace:g} s: ending it', ECHO))
         self._signal_group(signal.SIGKILL)
+
+    def settled(self):
+        """True when this run has ended and its whole process group is gone: nothing is left to clean up.
+
+        The window asks this before it closes. A child that outlived the tool, or ignored the stop request, is
+        exactly what a window that closed over its run would leave behind.
+        """
+        if self._proc is None:
+            return True
+        return self._exited.is_set() and not self._group_alive()
+
+    def stop_and_wait(self, grace=DEFAULT_GRACE, timeout=None):
+        """stop(), then wait until the whole group is gone, bounded. True when nothing is left of the run.
+
+        This is what a window calls before it exits. stop() only asks, and its SIGKILL escalation runs on a thread
+        of a process that is about to end, so it cannot be relied on there; here both happen in the caller's thread
+        and within the caller's bounds, so the window can show "stopping…" and close only once the children are
+        really gone. Never unbounded: a group that survives SIGKILL is reported by False, not waited on.
+        """
+        if self._proc is None or self.settled():
+            return True
+        if timeout is None:
+            timeout = float(grace) + self.group_grace + 5.0
+        deadline = time.monotonic() + float(timeout)
+        kill_at = time.monotonic() + max(0.0, float(grace))
+        self.stop(grace=grace)
+        killed = False
+        while True:
+            if self.settled():
+                return True
+            now = time.monotonic()
+            if now >= deadline:
+                return False
+            if not killed and now >= kill_at:
+                self._emit(Line(f'did not stop after {float(grace):g} s: ending it', ECHO))
+                self._signal_group(signal.SIGKILL)
+                killed = True
+            time.sleep(0.02)
 
     def wait(self, timeout=None):
         """True when the run ended within `timeout` seconds (None waits until it does)."""
