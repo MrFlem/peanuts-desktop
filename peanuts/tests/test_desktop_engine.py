@@ -18,7 +18,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 from peanuts.desktop.engine import (AlreadyRunning, Done, Exited, Line, Progress, SpawnError, Stage,
-                                    SupervisedProcess, parse_line, redact)
+                                    SupervisedProcess, parse_line, redact, redact_event)
 from peanuts.desktop.engine.events import ECHO
 from peanuts.desktop.engine.redact import SERIAL_PLACEHOLDER, SERIALS, protect_serial
 
@@ -133,6 +133,60 @@ class Redaction(unittest.TestCase):
 
     def test_a_line_without_a_path_is_untouched(self):
         self.assertEqual(redact('progress: 1/4'), 'progress: 1/4')
+
+
+class RedactedEvents(unittest.TestCase):
+    """B2: every field an event carries is redacted, not only a Line's text and a Done's path.
+
+    A `progress` or `done:` line is parsed into a second copy of its own text, in another field: the window shows
+    that copy in its status line and its progress bar, so redacting only the Line left the path in plain sight.
+    """
+
+    HOME = '/home/' + 'alice'
+    SERIAL = 'PEANUTS00EVENTSERIAL'   # fictional, and the shape and length of a real one
+
+    def tearDown(self):
+        SERIALS.clear()   # the registry is process-wide: never leak a value into another test
+
+    def test_a_progress_label_is_redacted(self):
+        event = redact_event(Progress(1, 4, 'Building ' + self.HOME + '/games/x'), self.HOME)
+        self.assertNotIn(self.HOME, event.label)
+        self.assertIn('~/games/x', event.label)
+        self.assertEqual((event.done, event.total), (1, 4))
+
+    def test_a_stage_text_is_redacted(self):
+        event = redact_event(Stage('Writing ' + self.HOME + '/games/x'), self.HOME)
+        self.assertNotIn(self.HOME, event.text)
+
+    def test_a_line_is_redacted(self):
+        self.assertNotIn(self.HOME, redact_event(Line('at ' + self.HOME + '/games/x'), self.HOME).text)
+
+    def test_a_done_path_is_redacted(self):
+        self.assertNotIn(self.HOME, redact_event(Done(self.HOME + '/games/x'), self.HOME).path)
+
+    def test_a_registered_serial_is_masked_in_every_field(self):
+        protect_serial(self.SERIAL)
+        line = redact_event(Line(self.SERIAL), self.HOME)
+        progress = redact_event(Progress(1, 2, self.SERIAL), self.HOME)
+        stage = redact_event(Stage(self.SERIAL), self.HOME)
+        done = redact_event(Done(self.SERIAL), self.HOME)
+        self.assertNotIn(self.SERIAL, line.text)
+        self.assertNotIn(self.SERIAL, progress.label)
+        self.assertNotIn(self.SERIAL, stage.text)
+        self.assertNotIn(self.SERIAL, done.path)
+
+    def test_an_event_with_nothing_to_redact_is_unchanged(self):
+        event = Progress(1, 4, 'Splitting the shaders out of the dump')
+        self.assertEqual(redact_event(event, self.HOME), event)
+
+    def test_a_progress_line_from_a_real_child_carries_no_home_folder(self):
+        run = SupervisedProcess(child('print("progress 1 2 ' + self.HOME + '/games/x", flush=True)'),
+                                home=self.HOME)
+        run.run(timeout=30)
+        progresses = [e for e in run.drain() if isinstance(e, Progress)]
+        self.assertTrue(progresses, 'the run emitted no Progress event')
+        self.assertNotIn(self.HOME, progresses[0].label)
+        self.assertIn('~/games/x', progresses[0].label)
 
 
 class Supervision(unittest.TestCase):

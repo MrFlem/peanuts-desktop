@@ -51,6 +51,8 @@ class Base(unittest.TestCase):
         os.makedirs(os.path.join(self.repo, 'peanuts', 'scripts'))
         shutil.copy(SCRIPT, os.path.join(self.repo, GATE))
         shutil.copy(ALLOW, os.path.join(self.repo, 'peanuts', 'scripts', 'publish-allowlist.txt'))
+        # Both are committed with the base commit below: the gate reads the allowlist from the object store at
+        # <target-ref>, so a copy that only sat in the working tree would give it nothing to check.
         self.branch = self.git('symbolic-ref', '--short', 'HEAD')
         self.commit('base.txt', 'upstream')
         self.base = self.git('rev-parse', 'HEAD')
@@ -78,6 +80,34 @@ class Base(unittest.TestCase):
 
     def check(self, *args, env=None):
         return subprocess.run(['sh', GATE, *args], cwd=self.repo, capture_output=True, text=True, env=env)
+
+    def set_allowlist(self, text, message='the allowlist'):
+        """Write the allowlist and commit it: the gate reads the published one, never the working tree."""
+        self.write('peanuts/scripts/publish-allowlist.txt', text)
+        self.git('add', '-A')
+        self.git('commit', '-q', '-m', message)
+
+    def stub_command(self, name, body):
+        """A PATH whose `name` is a sh script instead of the real program: `body` is its text."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, name)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('#!/bin/sh\n' + body)
+        os.chmod(path, 0o755)
+        return dict(os.environ, PATH=d + os.pathsep + os.environ.get('PATH', ''))
+
+    def stub_git_log_for(self, marker):
+        """A git whose `log` fails only for the call whose format starts with `marker`."""
+        body = ('seen=0\n'
+                'for a in "$@"; do\n'
+                '  [ "$a" = log ] && seen=1\n'
+                '  case $a in\n'
+                '    ' + marker + '*) [ "$seen" = 1 ] && { echo "injected failure" >&2; exit 128; } ;;\n'
+                '  esac\n'
+                'done\n'
+                'exec ' + REAL_GIT + ' "$@"\n')
+        return self.stub_command('git', body)
 
     def stub_git(self, subcommand):
         """A PATH whose git fails, and only for `subcommand`: the gate must not read that as a clean tree."""
@@ -195,6 +225,149 @@ class FailClosed(Base):
         self.assertNotIn('clean', r.stdout)
 
 
+class CommitMessagePipeline(Base):
+    """A1: every command in the trailer inspection fails the gate on its own, never a clean tree.
+
+    The inspection used to be one pipeline (git log | awk | grep), and POSIX sh has no pipefail: only grep's status
+    was read. A failing git log or awk left grep with nothing to find, which is what a clean range looks like.
+    """
+
+    AUTHOR_FORMAT = '--format=%h'
+    MESSAGE_FORMAT = '--format=@@'
+
+    def ai_trailer_commit(self):
+        self.write('peanuts/desktop/x.py', 'x = 1\n')
+        self.git('add', '-A')
+        self.git('commit', '-q', '-m', 'a change\n\nCo-Authored-By: Claude <noreply@anthropic.com>')
+
+    def test_the_author_log_failing_is_not_a_pass(self):
+        r = self.check(self.base, env=self.stub_git_log_for(self.AUTHOR_FORMAT))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('commit authors', r.stdout)
+        self.assertNotIn('clean', r.stdout)
+
+    def test_the_message_log_failing_is_not_a_pass_although_the_author_log_succeeded(self):
+        r = self.check(self.base, env=self.stub_git_log_for(self.MESSAGE_FORMAT))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('commit messages', r.stdout)
+        self.assertNotIn('clean', r.stdout)
+
+    def test_a_trailer_is_never_a_pass_over_a_failing_message_log(self):
+        # The trailer is there: a pipeline would have found it. The point is that the failing command fails the
+        # gate as well, and that the result never reads as clean.
+        self.ai_trailer_commit()
+        r = self.check(self.base, env=self.stub_git_log_for(self.MESSAGE_FORMAT))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('commit messages', r.stdout)
+        self.assertNotIn('clean', r.stdout)
+
+    def test_awk_failing_is_not_a_pass(self):
+        env = self.stub_command('awk', 'echo "injected failure" >&2\nexit 2\n')
+        r = self.check(self.base, env=env)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('awk failed', r.stdout)
+        self.assertNotIn('clean', r.stdout)
+
+    def test_a_trailer_is_never_a_pass_over_a_failing_awk(self):
+        self.ai_trailer_commit()
+        env = self.stub_command('awk', 'echo "injected failure" >&2\nexit 2\n')
+        r = self.check(self.base, env=env)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('awk failed', r.stdout)
+        self.assertNotIn('clean', r.stdout)
+
+    def test_the_trailer_is_found_when_every_command_succeeds(self):
+        self.ai_trailer_commit()
+        r = self.check(self.base)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn('AI trailer in a commit message', r.stdout)
+
+
+class AllowlistFromTheTarget(Base):
+    """A2: the exemptions are the ones published at <target-ref>, and the range's history is accounted for."""
+
+    def fixture_path(self):
+        return 'peanuts/tests/test_fixture_lines.py'
+
+    def fixture(self, name='alice'):
+        """A line shaped like the private data rule 2 stops, built by concatenation like the others here."""
+        return "        KEYS = '" + homed(name) + "/keys/prod.keys'"
+
+    def test_an_uncommitted_allowlist_entry_cannot_exempt_a_line(self):
+        line = self.fixture()
+        self.commit_lines(self.fixture_path(), [line])
+        self.write('peanuts/scripts/publish-allowlist.txt', self.fixture_path() + '\t' + line + '\n')
+        r = self.check(self.base)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn(self.fixture_path() + ':', r.stdout)
+        self.assertNotIn('clean', r.stdout)
+
+    def test_an_uncommitted_allowlist_deletion_cannot_drop_a_published_exemption(self):
+        line = self.fixture()
+        self.commit_lines(self.fixture_path(), [line])
+        self.set_allowlist(self.fixture_path() + '\t' + line + '\n')
+        self.write('peanuts/scripts/publish-allowlist.txt', '# the checkouts exemptions, edited and not committed\n')
+        r = self.check(self.base)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('clean', r.stdout)
+
+    def test_the_allowlist_comes_from_the_target_not_from_the_checkout(self):
+        line = self.fixture()
+        self.commit_lines(self.fixture_path(), [line])
+        self.set_allowlist(self.fixture_path() + '\t' + line + '\n')
+        head = self.git('rev-parse', 'HEAD')
+        self.git('checkout', '-q', self.base)   # this tree has neither the fixture nor its entry
+        r = self.check('--since', self.base, '--target', head)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('clean', r.stdout)
+
+    def test_an_entry_added_later_in_the_range_is_reported(self):
+        # The fixture and its entry may be committed in either order, so the entry covers the whole range - but
+        # the commit that predates it is named, so the exemption is never silent.
+        line = self.fixture()
+        self.commit_lines(self.fixture_path(), [line])
+        first = self.git('rev-parse', 'HEAD')
+        self.set_allowlist(self.fixture_path() + '\t' + line + '\n')
+        r = self.check(self.base)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('added later in this range', r.stdout)
+        self.assertIn(first, r.stdout)
+
+    def test_a_later_entry_cannot_cover_an_earlier_different_value(self):
+        # The line was a real value and a later commit edits it into the listed one: only the version whose text
+        # matches the entry is exempt, so the earlier commit is still a hit.
+        real = self.fixture('alice')
+        self.commit_lines(self.fixture_path(), [real])
+        self.write(self.fixture_path(), self.fixture('bob') + '\n')
+        self.set_allowlist(self.fixture_path() + '\t' + self.fixture('bob') + '\n')
+        r = self.check(self.base)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn(self.fixture_path() + ':1:', r.stdout)
+        self.assertIn('home-path', r.stdout)
+        self.assertNotIn(homed('alice'), r.stdout)
+        self.assertNotIn('clean', r.stdout)
+
+    def test_a_target_without_an_allowlist_has_no_exemptions(self):
+        self.commit_lines(self.fixture_path(), [self.fixture()])
+        self.git('rm', '-q', 'peanuts/scripts/publish-allowlist.txt')
+        self.git('commit', '-q', '-m', 'drops the allowlist')
+        r = self.check(self.base)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn(self.fixture_path() + ':1:', r.stdout)
+        self.assertNotIn('clean', r.stdout)
+
+    def test_an_allowlist_object_the_gate_cannot_read_fails(self):
+        line = self.fixture()
+        self.commit_lines(self.fixture_path(), [line])
+        self.set_allowlist(self.fixture_path() + '\t' + line + '\n')
+        oid = self.git('rev-parse', 'HEAD:peanuts/scripts/publish-allowlist.txt')
+        os.remove(os.path.join(self.repo, '.git', 'objects', oid[:2], oid[2:]))
+        r = self.check(self.base)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn('cannot read', r.stdout)
+        self.assertNotIn('clean', r.stdout)
+
+
 class Loopback(Base):
     """A loopback host is not a network address, and must not hide one beside it on the same line."""
 
@@ -306,8 +479,7 @@ class Rule2Exemptions(Base):
     def test_a_duplicate_entry_fails(self):
         path, line = ENTRIES[0]
         self.fixtures()
-        self.write('peanuts/scripts/publish-allowlist.txt',
-                   path + '\t' + line + '\n' + path + '\t' + line + '\n')
+        self.set_allowlist(path + '\t' + line + '\n' + path + '\t' + line + '\n')
         r = self.check(self.base)
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn('repeats an earlier entry', r.stdout)
@@ -316,7 +488,7 @@ class Rule2Exemptions(Base):
     def test_an_entry_with_no_tab_fails(self):
         path, line = ENTRIES[0]
         self.fixtures()
-        self.write('peanuts/scripts/publish-allowlist.txt', path + '\n')
+        self.set_allowlist(path + '\n')
         r = self.check(self.base)
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn('has no tab', r.stdout)
@@ -324,7 +496,7 @@ class Rule2Exemptions(Base):
     def test_an_entry_with_two_tabs_fails(self):
         path, line = ENTRIES[0]
         self.fixtures()
-        self.write('peanuts/scripts/publish-allowlist.txt', path + '\t' + line + '\tanother\n')
+        self.set_allowlist(path + '\t' + line + '\tanother\n')
         r = self.check(self.base)
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn('more than one tab', r.stdout)
@@ -332,7 +504,7 @@ class Rule2Exemptions(Base):
     def test_an_entry_outside_peanuts_tests_fails(self):
         path, line = ENTRIES[0]
         self.fixtures()
-        self.write('peanuts/scripts/publish-allowlist.txt', 'peanuts/desktop/x.py\t' + line + '\n')
+        self.set_allowlist('peanuts/desktop/x.py\t' + line + '\n')
         r = self.check(self.base)
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn('not under peanuts/tests/', r.stdout)
@@ -340,7 +512,7 @@ class Rule2Exemptions(Base):
     def test_an_entry_with_a_cr_fails(self):
         path, line = ENTRIES[0]
         self.fixtures()
-        self.write('peanuts/scripts/publish-allowlist.txt', path + '\t' + line + '\r\n')
+        self.set_allowlist(path + '\t' + line + '\r\n')
         r = self.check(self.base)
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn('has a CR', r.stdout)
@@ -351,7 +523,7 @@ class Rule2Exemptions(Base):
         self.write(path, line + '\n')
         self.git('add', '-A')
         self.git('commit', '-q', '-m', 'one fixture line')
-        self.write('peanuts/scripts/publish-allowlist.txt', path + '\t' + line)
+        self.set_allowlist(path + '\t' + line)   # no trailing newline, and the last entry must still count
         r = self.check(self.base)
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertIn('clean', r.stdout)
@@ -361,7 +533,7 @@ class Rule2Exemptions(Base):
         path, line = ENTRIES[0]
         self.assertTrue(line.startswith(' '), 'the first fixture line is indented; this test needs one that is')
         self.fixtures()
-        self.write('peanuts/scripts/publish-allowlist.txt', path + '\t' + line.lstrip(' ') + '\n')
+        self.set_allowlist(path + '\t' + line.lstrip(' ') + '\n')
         r = self.check(self.base)
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn('stale publish-allowlist entry', r.stdout)
@@ -459,9 +631,19 @@ class PrePushHook(Base):
         self.git('update-ref', 'refs/remotes/upstream/main', self.base)
 
     def push(self, *updates):
-        stdin = ''.join('%s %s %s %s\n' % u for u in updates)
+        return self.push_raw(''.join('%s %s %s %s\n' % u for u in updates))
+
+    def push_raw(self, stdin):
         return subprocess.run(['sh', self.hook, 'origin', 'https://example.org/repo.git'],
                               cwd=self.repo, input=stdin, capture_output=True, text=True)
+
+    def local_hook(self, body):
+        """An existing hook of the same name, which install-hooks.sh chains and must not let eat stdin."""
+        path = os.path.join(self.repo, '.git', 'hooks', 'pre-push.local')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('#!/bin/sh\n' + body)
+        os.chmod(path, 0o755)
+        return path
 
     def secret_commit(self, name='net.py', ip='5'):
         self.commit_lines(name, ["HOST = '" + '192.168.' + ip + ".9'"])
@@ -522,6 +704,67 @@ class PrePushHook(Base):
         # The clean update was checked and passed; the other one failed; the push is refused for both together.
         self.assertIn(self.base + '..' + good, r.stdout)
         self.assertIn('private data in changed files', r.stdout)
+
+    def test_a_local_hook_that_consumes_stdin_cannot_hide_a_secret(self):
+        # Codex's scenario: the previous hook reads every record and exits 0, so a hook that then read stdin itself
+        # saw none, checked nothing and allowed the push. The records are captured first, then replayed.
+        self.local_hook('cat > /dev/null\nexit 0\n')
+        sha = self.secret_commit()
+        r = self.push(('refs/heads/topic', sha, 'refs/heads/topic', ZERO))
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn('private data in changed files', r.stdout)
+
+    def test_a_local_hook_that_consumes_stdin_does_not_stop_a_clean_push(self):
+        self.local_hook('cat > /dev/null\nexit 0\n')
+        self.commit('clean.txt', 'a clean change')
+        sha = self.git('rev-parse', 'HEAD')
+        r = self.push(('refs/heads/main', sha, 'refs/heads/main', self.base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('clean', r.stdout)
+
+    def test_both_hooks_are_given_every_record(self):
+        seen = os.path.join(self.repo, 'the-local-hook-saw.txt')
+        self.local_hook('cat > ' + seen + '\nexit 0\n')
+        sha = self.git('rev-parse', 'HEAD')
+        updates = (('refs/heads/one', sha, 'refs/heads/one', self.base),
+                   ('refs/heads/two', sha, 'refs/heads/two', ZERO))
+        r = self.push(*updates)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(seen, encoding='utf-8') as f:
+            self.assertEqual(f.read(), ''.join('%s %s %s %s\n' % u for u in updates))
+
+    def test_a_greedy_local_hook_does_not_stop_the_other_refs_from_being_checked(self):
+        self.local_hook('cat > /dev/null\nexit 0\n')
+        good = self.git('rev-parse', 'HEAD')
+        bad = self.secret_commit()
+        r = self.push(('refs/heads/one', good, 'refs/heads/one', self.base),
+                      ('refs/heads/two', bad, 'refs/heads/two', ZERO))
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn(self.base + '..' + good, r.stdout)
+        self.assertIn('private data in changed files', r.stdout)
+
+    def test_a_local_hook_that_refuses_stops_the_push(self):
+        self.local_hook('exit 1\n')
+        sha = self.git('rev-parse', 'HEAD')
+        r = self.push(('refs/heads/main', sha, 'refs/heads/main', self.base))
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn('pre-push.local refused this push', r.stdout)
+
+    def test_a_push_with_no_records_is_refused(self):
+        # Records that could not be captured look exactly like this: never an empty set that passes.
+        r = self.push()
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn('no ref updates', r.stdout)
+
+    def test_a_record_this_hook_cannot_read_is_refused(self):
+        r = self.push_raw('refs/heads/main abc\n')
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn('not four fields', r.stdout)
+
+    def test_a_record_without_a_commit_id_is_refused(self):
+        r = self.push_raw('refs/heads/main nothex refs/heads/main ' + ZERO + '\n')
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn('does not name a commit', r.stdout)
 
     def test_a_deleted_ref_publishes_nothing(self):
         r = self.push(('(delete)', ZERO, 'refs/heads/gone', self.base))

@@ -8,13 +8,20 @@ What it deliberately does not do yet: build. The plan is displayed, not executed
 keys are Phase B, and the transfer is Phase D. Buttons for those are absent rather than disabled, so the window
 never implies a capability it does not have.
 
-Keyboard: the Plan, Preflight and Log panes are read-only rather than `disabled`, so Tab reaches them and their text
-can be scrolled, selected and copied; Alt+P, Alt+K and Alt+L put the focus on each one. The log follows new output
-only while it is scrolled to the bottom, so reading earlier lines is not interrupted by the next line.
+Keyboard: the Plan, Preflight and Log panes are read-only rather than `disabled`, so they can hold the focus and
+their text can be scrolled, selected and copied. Tab and Shift+Tab move the focus between widgets (they never type
+a tab into a pane), and Alt+P, Alt+K and Alt+L put the focus on each pane; the window's own shortcuts (Ctrl+O,
+Ctrl+D, F5, Esc) still work while a pane has it. That rule is ui/keys.py, kept out of this file so it is checked on
+a machine with no display. The log follows new output only while it is scrolled to the bottom.
 
-Closing: the window does not exit over a running check. It asks, then waits - bounded, on a worker thread so the
-window stays responsive - for the check's whole process group to be gone before it destroys itself; a group that
-cannot be confirmed gone is sent SIGKILL and reported on stderr.
+Closing: the window does not exit over a run whose processes may still be alive. Exited is not the end of the run:
+the supervisor ends what the tool started afterwards, so the run is kept until it is settled, and a window that is
+closing asks (ui/lifecycle.py), then waits - bounded, on a worker thread so the window stays responsive - for the
+whole process group to be gone; a group that cannot be confirmed gone is sent SIGKILL and reported on stderr.
+
+Redaction: every line, progress label, stage line and pack path the supervisor emits is redacted before it reaches
+this file (engine.redact_event). The About and Plan panes show the path the user chose, which is locally useful and
+not a log; an error message shown there passes through the same redaction.
 
 Threading rules, which matter more than the layout:
   * Tk is touched only on the main thread. Work happens in worker threads and arrives through `self.ui_queue`,
@@ -30,9 +37,11 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from .. import __version__, repo_root
-from ..engine import (AlreadyRunning, Exited, Line, Progress, SpawnError, Stage, SupervisedProcess, python_argv)
+from ..engine import (AlreadyRunning, Exited, Line, Progress, SpawnError, Stage, SupervisedProcess, python_argv,
+                      redact)
 from ..engine.events import ECHO
 from ..model import LatestSelection, classify, local_checks, plan_for, summary
+from . import keys, lifecycle
 
 TITLE = 'Peanuts Desktop'
 HINT = ('Ctrl+O game files   Ctrl+D dump folder   F5 check the packer environment   Esc stop\n'
@@ -40,19 +49,22 @@ HINT = ('Ctrl+O game files   Ctrl+D dump folder   F5 check the packer environmen
 QUIT_NOTE = 'Stopping… the window closes once the check and the processes it started are gone.'
 QUIT_TIMEOUT = 12.0   # stop_and_wait()'s own bound is shorter; this is the window's backstop
 
-# The keys a read-only pane may still act on: moving around, selecting and copying. Everything else is refused, so
-# the pane can hold the keyboard focus (a `disabled` Text cannot: Tk sends its keys nowhere) without taking an edit.
-NAV_KEYS = frozenset({'Left', 'Right', 'Up', 'Down', 'Home', 'End', 'Prior', 'Next', 'Tab', 'ISO_Left_Tab',
-                      'Shift_L', 'Shift_R', 'Control_L', 'Control_R', 'Alt_L', 'Alt_R', 'Super_L', 'Super_R',
-                      'Caps_Lock', 'Escape', 'Insert'})
-
 
 def _refuse_edit(event):
-    """'break' for every key that would change the pane, so it can be focused without being editable."""
-    if event.keysym in NAV_KEYS:
-        return None
-    if event.state & 0x4 and event.keysym.lower() in ('a', 'c', 'insert'):   # Control-a selects, Control-c copies
-        return None
+    """'break' for every key that would change the pane, so it can be focused without being editable.
+
+    The rule itself is ui/keys.py: it keeps the window's own shortcuts working while a pane has the focus, which
+    answering 'break' to every letter used to prevent (the toplevel binding never ran).
+    """
+    return 'break' if keys.refuse_edit(event.keysym, event.state) else None
+
+
+def _move_focus(step, event):
+    """Tab and Shift+Tab: move the keyboard focus, and never type a tab into the pane."""
+    widget = event.widget
+    target = widget.tk_focusNext() if step > 0 else widget.tk_focusPrev()
+    if target is not None:
+        target.focus_set()
     return 'break'
 
 
@@ -60,6 +72,8 @@ def read_only(text):
     """A Text pane that takes the keyboard focus, scrolls and copies, and refuses every edit."""
     text.configure(takefocus=True, highlightthickness=2, highlightbackground='#c8c8c8', highlightcolor='#2c7fb8')
     text.bind('<Key>', _refuse_edit)
+    for sequence, keysym in (('<Tab>', 'Tab'), ('<Shift-Tab>', 'Shift-Tab'), ('<ISO_Left_Tab>', 'ISO_Left_Tab')):
+        text.bind(sequence, lambda event, s=keys.focus_step(keysym): _move_focus(s, event))
     for sequence in ('<<Cut>>', '<<Paste>>', '<<Clear>>', '<Button-2>'):
         text.bind(sequence, lambda _e: 'break')
     return text
@@ -239,7 +253,9 @@ class App:
             # gone the slot is still held, and starting another run would put two builds in one pack folder.
             self.check_btn.configure(state='disabled' if SupervisedProcess.busy() else 'normal')
             self.stop_btn.configure(state='disabled')
-            self.proc = None
+            # The run is kept here on purpose: Exited says the tool ended, not that the processes it started are
+            # gone (the supervisor ends the rest of its process group afterwards). _pump lets it go once it is
+            # finished, and nothing may close the window over it before that.
 
     def _pump(self):
         try:
@@ -253,12 +269,18 @@ class App:
                 if kind == 'info':
                     self.show_input(payload)
                 elif kind == 'error':
-                    self.set_about(str(payload))
+                    # A reader's message can name the path it was given: the same redaction as the log's lines.
+                    self.set_about(redact(str(payload)))
         except queue.Empty:
             pass
-        if self.proc is not None:
-            for event in self.proc.drain():
+        run = self.proc
+        if run is not None:
+            for event in run.drain():
                 self.handle(event)
+            if lifecycle.finished(run, SupervisedProcess.busy()):
+                self.proc = None
+                if self._quitting is None:
+                    self.check_btn.configure(state='normal')
         self.root.after(100, self._pump)
 
     # --- what the panes say ---------------------------------------------------------------------
@@ -301,7 +323,7 @@ class App:
         if self._quitting is not None:
             return      # already stopping: a repeated WM_DELETE must not start a second shutdown
         run = self.proc
-        if run is not None and not run.settled():
+        if lifecycle.still_running(run):
             if not messagebox.askyesno(TITLE, 'A check is still running. Stop it and quit?'):
                 return
             self._quitting = run

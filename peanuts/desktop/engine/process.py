@@ -38,9 +38,9 @@ import sys
 import threading
 import time
 
-from .events import ECHO, RED, Done, Exited, Line
+from .events import ECHO, RED, Exited, Line
 from .markers import parse_line
-from .redact import redact
+from .redact import redact, redact_event
 
 POSIX = os.name != 'nt'
 DEFAULT_GRACE = 5.0            # SIGTERM to SIGKILL, for a run that has not ended at all
@@ -224,13 +224,9 @@ class SupervisedProcess:
         if self._closing.is_set():
             return
         for event in parse_line(raw):
-            if isinstance(event, Line) and self.redact_output:
-                event = Line(redact(event.text, self.home), event.severity)
-            elif isinstance(event, Done) and self.redact_output:
-                # A Done's path is the pack folder the window offers to open and a report quotes: the same
-                # treatment as the line it was read from, so the path a reader sees names no home folder.
-                event = Done(redact(event.path, self.home), event.detail)
-            self._emit(event)
+            # Every field an event carries: a line's text, a Progress label, a Stage line, and the pack path a Done
+            # names (the folder the window offers to open, and the one a report quotes).
+            self._emit(redact_event(event, self.home) if self.redact_output else event)
 
     @staticmethod
     def _take_lines(pending):

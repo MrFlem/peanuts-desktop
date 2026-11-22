@@ -7,8 +7,10 @@ peanuts/tests/test_desktop_engine.py run on a machine with no display (and in CI
 from .events import Done, Event, Exited, Line, Progress, Stage
 from .markers import parse_line, parse_stream
 from .process import AlreadyRunning, SpawnError, SupervisedProcess, python_argv
-from .redact import SERIAL_PLACEHOLDER, SERIALS, protect_serial, redact, redact_lines, redact_serials
+from .redact import (SERIAL_PLACEHOLDER, SERIALS, protect_serial, redact, redact_event, redact_lines,
+                     redact_serials)
 
 __all__ = ['Done', 'Event', 'Exited', 'Line', 'Progress', 'Stage', 'parse_line', 'parse_stream',
            'AlreadyRunning', 'SpawnError', 'SupervisedProcess', 'python_argv',
-           'redact', 'redact_lines', 'SERIALS', 'SERIAL_PLACEHOLDER', 'protect_serial', 'redact_serials']
+           'redact', 'redact_event', 'redact_lines', 'SERIALS', 'SERIAL_PLACEHOLDER', 'protect_serial',
+           'redact_serials']

@@ -24,6 +24,9 @@ from __future__ import annotations
 import os
 import re
 import threading
+from typing import overload
+
+from .events import Done, Event, Line, Progress, Stage
 
 RE_HOME = re.compile(r'/home/[^/\s"\'`]+')
 RE_USERS = re.compile(r'/Users/[^/\s"\'`]+')
@@ -114,3 +117,43 @@ def redact_lines(lines, home=None):
     """redact() over an iterable of lines, lazily."""
     for line in lines:
         yield redact(line, home)
+
+
+@overload
+def redact_event(event: Line, home: str | None = None) -> Line: ...
+
+
+@overload
+def redact_event(event: Progress, home: str | None = None) -> Progress: ...
+
+
+@overload
+def redact_event(event: Stage, home: str | None = None) -> Stage: ...
+
+
+@overload
+def redact_event(event: Done, home: str | None = None) -> Done: ...
+
+
+@overload
+def redact_event(event: Event, home: str | None = None) -> Event: ...
+
+
+def redact_event(event, home=None):
+    """The same event with every field it carries redacted: the text of a line, a progress label, a stage line and
+    the pack path a Done names. The value of the enclosing Line is not enough: a `progress` or `done:` line is a
+    second copy of the same text in another field, and the window shows that copy in its status line, its
+    progress bar and the path it offers to open.
+
+    Typed per event so a caller that passes a Line gets a Line back: the window and the tests then read the field
+    they know is there instead of a union.
+    """
+    if isinstance(event, Line):
+        return Line(redact(event.text, home), event.severity)
+    if isinstance(event, Progress):
+        return Progress(event.done, event.total, redact(event.label, home))
+    if isinstance(event, Stage):
+        return Stage(redact(event.text, home))
+    if isinstance(event, Done):
+        return Done(redact(event.path, home), event.detail)
+    return event

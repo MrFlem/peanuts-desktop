@@ -18,6 +18,7 @@ sys.path.insert(0, str(REPO))
 from peanuts.desktop.model import Kind, InputInfo, LatestSelection, classify, plan_for, summary
 from peanuts.desktop.model.plan import BUILD_SCRIPT, PACK_SCRIPT
 from peanuts.desktop.platform import open_folder
+from peanuts.desktop.ui import keys, lifecycle
 
 
 class Classification(unittest.TestCase):
@@ -268,24 +269,14 @@ class WindowStructure(unittest.TestCase):
         for binding in ("('p', self.plan)", "('k', self.checks)", "('l', self.log)"):
             self.assertIn(binding, text)
 
-    def test_the_edit_filter_refuses_typing_and_keeps_navigation(self):
+    def test_the_edit_filter_is_the_tested_rule_not_a_second_copy(self):
+        # The rule itself is ui/keys.py (see Keyboard below); this reads the window to prove it delegates.
         module = ast.parse(self.source())
-        nav = next(n for n in module.body
-                   if isinstance(n, ast.Assign) and getattr(n.targets[0], 'id', '') == 'NAV_KEYS')
         fn = next(n for n in module.body if isinstance(n, ast.FunctionDef) and n.name == '_refuse_edit')
-        namespace = {}
-        exec(compile(ast.Module(body=[nav, fn], type_ignores=[]), '<app>', 'exec'), namespace)
-
-        class Key:
-            def __init__(self, keysym, state=0):
-                self.keysym, self.state = keysym, state
-
-        filter_ = namespace['_refuse_edit']
-        self.assertIsNone(filter_(Key('Down')))
-        self.assertIsNone(filter_(Key('Prior')))
-        self.assertIsNone(filter_(Key('c', 4)))   # Control-c copies
-        self.assertEqual(filter_(Key('a')), 'break')
-        self.assertEqual(filter_(Key('BackSpace')), 'break')   # a key with no legal action is refused
+        body = ast.get_source_segment(self.source(), fn) or ''
+        self.assertIn('keys.refuse_edit', body)
+        self.assertFalse(any(isinstance(n, ast.Assign) and getattr(n.targets[0], 'id', '') == 'NAV_KEYS'
+                             for n in module.body), 'app.py still carries its own key list')
 
     def test_the_log_follows_only_when_it_is_at_the_bottom(self):
         module = ast.parse(self.source())
@@ -320,8 +311,109 @@ class WindowStructure(unittest.TestCase):
         self.assertTrue(calls(close, 'Thread'), 'close() does not hand the bounded wait to a worker thread')
         self.assertTrue(calls(worker, 'stop_and_wait'), '_shutdown_worker does not wait for the process group')
         self.assertTrue(calls(finish, 'destroy'), 'nothing destroys the window once the wait is over')
-        self.assertFalse(calls(close, 'destroy') and not calls(close, 'settled'),
+        self.assertFalse(calls(close, 'destroy') and not (calls(close, 'still_running') or calls(close, 'settled')),
                          'close() destroys the window without checking the run first')
+
+
+class Keyboard(unittest.TestCase):
+    """B1: Tab and Shift+Tab move the focus, and the window's shortcuts survive a focused pane.
+
+    ui/keys.py imports no Tk, so these are real checks of the rule the window applies to every key. They are still
+    not rendered-GUI verification: no pane was focused, typed into, scrolled or copied from here (this machine and
+    CI have no display).
+    """
+
+    APP = REPO / 'peanuts' / 'desktop' / 'ui' / 'app.py'
+
+    def test_tab_and_shift_tab_are_focus_moves(self):
+        self.assertEqual(keys.focus_step('Tab'), 1)
+        self.assertEqual(keys.focus_step('ISO_Left_Tab'), -1)   # what Tk reports for Shift+Tab on X11
+        self.assertEqual(keys.focus_step('Shift-Tab'), -1)
+        self.assertEqual(keys.focus_step('a'), 0)
+        self.assertNotIn('Tab', keys.NAV_KEYS, 'Tab must be handled by its own binding, not passed through')
+
+    def test_the_window_shortcuts_reach_the_window_from_a_pane(self):
+        for keysym, state in (('o', keys.CONTROL), ('d', keys.CONTROL), ('p', keys.ALT),
+                              ('k', keys.ALT), ('l', keys.ALT), ('F5', 0), ('Escape', 0),
+                              ('Down', 0), ('Prior', 0)):
+            self.assertFalse(keys.refuse_edit(keysym, state), (keysym, state))
+
+    def test_typing_is_refused(self):
+        for keysym in ('a', 'x', 'BackSpace', 'Return', 'space'):
+            self.assertTrue(keys.refuse_edit(keysym), keysym)
+        self.assertTrue(keys.refuse_edit('c'), 'a bare c is a letter, not a copy')
+        self.assertFalse(keys.refuse_edit('c', keys.CONTROL))
+
+    def test_a_control_letter_that_is_not_a_shortcut_is_refused(self):
+        self.assertTrue(keys.refuse_edit('w', keys.CONTROL))
+
+    def test_the_panes_bind_both_tab_keys_to_a_focus_move(self):
+        text = self.APP.read_text()
+        for sequence in ("'<Tab>'", "'<Shift-Tab>'", "'<ISO_Left_Tab>'"):
+            self.assertIn(sequence, text)
+        self.assertIn('tk_focusNext', text)
+        self.assertIn('tk_focusPrev', text)
+        move = _function(self.APP, '_move_focus')
+        returns = [n for n in ast.walk(move) if isinstance(n, ast.Return)]
+        self.assertTrue(any(isinstance(r.value, ast.Constant) and r.value.value == 'break' for r in returns),
+                        '_move_focus does not stop the key after moving the focus, so Tk would also type it')
+
+
+class RunLifecycle(unittest.TestCase):
+    """B3: a run whose processes may still be alive is kept, and a window may not close over it."""
+
+    APP = REPO / 'peanuts' / 'desktop' / 'ui' / 'app.py'
+
+    class Run:
+        def __init__(self, exit_event=None, settled=True):
+            self.exit_event = exit_event
+            self.is_settled = settled
+
+        def settled(self):
+            return self.is_settled
+
+    def test_a_run_that_has_not_exited_is_not_finished(self):
+        run = self.Run(None, settled=False)
+        self.assertFalse(lifecycle.finished(run, busy=True))
+        self.assertTrue(lifecycle.still_running(run))
+
+    def test_an_exited_run_with_processes_left_is_kept(self):
+        # Exited only says the tool ended: its process group may still be alive, and the run slot still taken.
+        run = self.Run('exited', settled=False)
+        self.assertFalse(lifecycle.finished(run, busy=True))
+        self.assertTrue(lifecycle.still_running(run))
+
+    def test_a_settled_run_is_finished(self):
+        run = self.Run('exited', settled=True)
+        self.assertTrue(lifecycle.finished(run, busy=False))
+        self.assertFalse(lifecycle.still_running(run))
+
+    def test_a_run_whose_slot_came_back_is_finished(self):
+        self.assertTrue(lifecycle.finished(self.Run('exited', settled=False), busy=False))
+
+    def test_no_run_is_finished(self):
+        self.assertTrue(lifecycle.finished(None, busy=False))
+        self.assertFalse(lifecycle.still_running(None))
+
+    def test_the_window_does_not_drop_the_run_on_exited(self):
+        handle = _function(self.APP, 'handle')
+        for node in ast.walk(handle):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    self.assertFalse(isinstance(target, ast.Attribute) and target.attr == 'proc',
+                                     'handle() drops the run while its process group may still be alive')
+
+    def test_the_window_keeps_the_run_until_the_supervisor_says_it_is_finished(self):
+        pump = _function(self.APP, '_pump')
+        calls = [n for n in ast.walk(pump) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute) and n.func.attr == 'finished']
+        self.assertTrue(calls, '_pump never asks whether the run is finished')
+
+    def test_closing_asks_the_lifecycle_rule(self):
+        close = _function(self.APP, 'close')
+        calls = [n for n in ast.walk(close) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute) and n.func.attr == 'still_running']
+        self.assertTrue(calls, 'close() does not use the rule that keeps a live run open')
 
 
 class Summaries(unittest.TestCase):
@@ -345,6 +437,7 @@ class Layers(unittest.TestCase):
             "sys.modules['tkinter'] = None\n"      # any "import tkinter" from now on raises ImportError
             f'sys.path.insert(0, {str(REPO)!r})\n'
             'import peanuts.desktop.engine, peanuts.desktop.model, peanuts.desktop.platform\n'
+            'import peanuts.desktop.ui.keys, peanuts.desktop.ui.lifecycle\n'
         )
         r = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)

@@ -110,8 +110,9 @@ this project has touched, and which edits are marked / queued for a Banana Nativ
 - **No private data:** no LAN or adb addresses, home or mount paths, work-folder paths, or personal e-mails in any
   committed file or message; use placeholders (`<work dir>`, `<device ip>`).
 - `sh peanuts/scripts/check-publish.sh` must print "clean" before any push. It reads the commits being published
-  (never the working tree), and the `pre-push` hook gives it each pushed ref's own range; CONTRIBUTING.md
-  "Publishing rules" says what it finds and what it cannot.
+  (never the working tree), including the allowlist from the target commit, and the `pre-push` hook gives it each
+  pushed ref's own range after capturing the reference updates and replaying them to any chained hook;
+  CONTRIBUTING.md "Publishing rules" says what it finds and what it cannot.
 
 ## Where findings go
 

@@ -76,23 +76,29 @@ output changes, `engine/markers.py` changes with it.
 
 ## Keyboard and closing
 
-The Plan, Preflight and Log panes are read-only rather than `disabled`, so `Tab` reaches them and their text can be
-scrolled, selected and copied (`Ctrl+C`; `Ctrl+A` selects the pane). `Alt+P`, `Alt+K` and `Alt+L` put the focus on
-the Plan, Preflight and Log pane. The log follows new output only while it is scrolled to the bottom, so reading
-earlier lines is not interrupted.
+The Plan, Preflight and Log panes are read-only rather than `disabled`, so they can hold the focus and their text
+can be scrolled, selected and copied (`Ctrl+C`; `Ctrl+A` selects the pane). `Tab` and `Shift+Tab` move the focus
+between widgets and never type a tab into a pane; `Alt+P`, `Alt+K` and `Alt+L` put the focus on the Plan, Preflight
+and Log pane. The window's own shortcuts (`Ctrl+O`, `Ctrl+D`, `F5`, `Esc`) keep working while a pane has the focus:
+that rule is `ui/keys.py`, so it is checked without a display. The log follows new output only while it is scrolled
+to the bottom, so reading earlier lines is not interrupted.
 
 Closing the window during a check asks first, then stops the run and waits - bounded - for its whole process group
-to be gone before the window goes away. A group that cannot be confirmed gone is sent `SIGKILL` and named on
-stderr, rather than left behind by a window that closed over it.
+to be gone before the window goes away. `Exited` is not the end of the run: the supervisor ends what the tool
+started afterwards, so the window keeps the run until it reports settled (`ui/lifecycle.py`) and will not close
+over it. A group that cannot be confirmed gone is sent `SIGKILL` and named on stderr, rather than left behind by a
+window that closed over it.
 
 ## Security
 
 - The window never reads `prod.keys`; it only passes a path to the importer (`Phase B`). Nothing about the file's
   contents is displayed, logged or stored.
-- Every line passes through `engine/redact.py` before it reaches the log pane or a screenshot, including the
-  `$ <command>` line the window prints itself and the pack path a `done:` line carries: home folders become `~` or
-  `<user>`. The shortened path still opens locally, so the pane stays useful while what you copy out of it is what
-  is safe to share. Do not disable it to debug something that will be shared.
+- Every event passes through `engine/redact.py` before it reaches the window, not only a `Line`: a `progress`
+  label, a stage line, the pack path a `done:` line carries and the `$ <command>` line the window prints itself are
+  redacted too, so a home folder becomes `~` or `<user>` wherever it would appear (log, status line, progress text),
+  and an error the reader reports passes through the same redaction. The shortened path still opens locally, so the
+  pane stays useful while what you copy out of it is what is safe to share. Do not disable it to debug something
+  that will be shared.
 - Device serials become `[REDACTED_DEVICE_SERIAL]` once registered with `engine/redact.protect_serial()`. Only a
   registered serial is matched — never every long alphanumeric string, which would hide title IDs and versions —
   and registering one never prints it. Phase A registers none; the transfer step (Phase D) registers the serials
@@ -108,10 +114,11 @@ python peanuts/tests/test_desktop_engine.py     # markers, redaction, real child
 python peanuts/tests/test_desktop_model.py      # classification, the run plan, the no-tkinter rule
 ```
 
-The window's keyboard panes, log following and closing are checked by reading its source
-(`test_desktop_model.py`, `WindowStructure`): this machine and CI have no display, so no pane was rendered, focused
-or scrolled in a test, and no GUI behaviour is claimed from those checks. The device plan for what they cannot cover
-is in the WO-020-SEC report.
+The keyboard rules and the run lifecycle are checked by running them (`ui/keys.py` and `ui/lifecycle.py` import no
+Tk, so `Keyboard` and `RunLifecycle` in `test_desktop_model.py` exercise the real functions), and the rest of the
+window's structure is read from its source (`WindowStructure`). This machine and CI have no display, so no pane was
+rendered, focused, typed into, scrolled or copied from in a test, and no GUI behaviour is claimed from those checks.
+The device plan for what they cannot cover is in the WO-020-SEC R2 report.
 
 Both run in CI through `.github/workflows/peanuts.yml`, which runs every `peanuts/tests/test_*.py` on Python 3.14
 with no display.

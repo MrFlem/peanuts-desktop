@@ -31,6 +31,11 @@
 #   GPT, Copilot, Gemini, Cursor, Devin, ...). The person who submits a change is its author; tools are not
 #   contributors.
 #
+#   The inspection is four commands, each checked on its own (git log for the authors, git log for the messages,
+#   awk for the trailer lines, grep for the pattern): a failure in any of them fails the gate. It is not a pipeline,
+#   because POSIX sh has no pipefail and a pipeline reports only its last command - which used to turn a broken
+#   git log or awk into "no trailer found" and a clean verdict.
+#
 # RULE 2, NO PRIVATE DATA
 #   No file the range changes may contain a LAN address, a local home or mount path, an assistant's work folder, an
 #   adb-over-network address or a personal e-mail, and no high-confidence credential shape (a private key header,
@@ -41,6 +46,25 @@
 #   prefix or a line number, by peanuts/scripts/publish-allowlist.txt (<path><TAB><the line, byte for byte>): a
 #   private-looking line that is not listed there fails, and a listed line that is missing from the file at
 #   <target-ref>, edited, deleted with its fixture, or repeated (in the file or as a second allowlist entry) fails.
+#
+# THE ALLOWLIST IS READ FROM <target-ref>, NEVER FROM THE WORKING TREE
+#   The exemptions are the ones published at the target commit, read with git cat-file. An uncommitted edit to the
+#   file therefore cannot change the verdict for the same --since/--target pair, in either direction: a local entry
+#   cannot exempt a line that was published without it, and a local deletion cannot make a published exemption
+#   fail. A tree whose target has no allowlist has no exemptions; an object the gate cannot read fails it.
+#
+#   The policy for the commits in between, which is what a multi-commit range is:
+#     * a new fixture and its entry may be committed in any order, so the entry is taken from the target for the
+#       whole range; when it was not yet present at the commit whose version of the file holds the line, the gate
+#       prints that ("added later in this range") instead of passing it silently;
+#     * a line only exempts the versions whose text is byte-identical to the listed line. A commit that added a real
+#       value and a later commit that edited it is still a hit: editing the line breaks the match, so a later
+#       exception cannot launder an earlier, different value;
+#     * a fixture deleted anywhere makes its entries stale, because each entry must still match exactly one line of,
+#       its file at the target; a file deleted with its fixture is reported the same way;
+#     * an entry removed by a later commit while its line remains is caught by the scan of that later version: the
+#       line is no longer exempt there, so it is reported;
+#     * one entry exempts one occurrence in each version, so a second copy of a listed line fails.
 #
 #   The report names a file, a line and a reason code, never the value: this output goes to terminals, logs and
 #   handoff reports. File paths are repository-relative, so they name nothing outside the repository.
@@ -61,6 +85,8 @@ die() { echo "check-publish: $*"; exit 1; }
 cd "$(git rev-parse --show-toplevel)" || die 'not in a git work tree'
 
 tab=$(printf '\t')
+tmp="${TMPDIR:-/tmp}/check-publish.$$"
+trap 'rm -f "$tmp".*' 0 1 2 15
 
 # --- the range ----------------------------------------------------------------------------------
 since=''
@@ -94,9 +120,15 @@ AI='claude|anthropic|codex|openai|chatgpt|gpt-[0-9]|copilot|gemini|cursor|devin|
 
 # --- rule 1: authors, committers, trailers ------------------------------------------------------
 # The report names the commit, not the author line: an address in a CI log is the same private data rule 2 is about.
-log=$(git log --format='%h %an <%ae> | %cn <%ce>' "$range") \
-	|| die "git log $range failed: the gate cannot read the commits that would be published"
-bad=$(printf '%s\n' "$log" | grep -iE -- "$AI")
+#
+# Each step writes a file and is checked before the next one reads it. A pipeline would report only its last
+# command's status, and POSIX sh has no pipefail: a git log that fails part-way, or an awk that does, used to leave
+# grep with nothing to find, and "nothing to find" is what a clean range looks like. Every command here fails the
+# gate on its own, whatever the other ones did.
+AI_TRAILER="^[0-9a-f]+: *(co-authored-by|signed-off-by|generated[- ]with|assisted[- ]by|with[- ]the[- ]help[- ]of).*($AI)|🤖"
+git log --format='%h %an <%ae> | %cn <%ce>' "$range" > "$tmp.authors" \
+	|| die "git log $range failed: the gate cannot read the commit authors"
+bad=$(grep -iE -- "$AI" "$tmp.authors")
 case $? in
 	0) echo 'AI author/committer (the person who submits a change is its author and committer; see peanuts/docs/AGENTS.md):'
 	   printf '%s\n' "$bad" | cut -d' ' -f1
@@ -104,9 +136,11 @@ case $? in
 	1) ;;
 	*) die 'grep failed on the commit authors: the gate cannot finish' ;;
 esac
-bad=$(git log --format='@@%h%n%B' "$range" \
-	| awk '/^@@/{h=substr($0,3); next} {print h": "$0}' \
-	| grep -iE -- "^[0-9a-f]+: *(co-authored-by|signed-off-by|generated[- ]with|assisted[- ]by|with[- ]the[- ]help[- ]of).*($AI)|🤖")
+git log --format='@@%h%n%B' "$range" > "$tmp.messages" \
+	|| die "git log $range failed: the gate cannot read the commit messages"
+awk '/^@@/{h=substr($0,3); next} {print h": "$0}' "$tmp.messages" > "$tmp.trailers" \
+	|| die 'awk failed on the commit messages: the gate cannot finish'
+bad=$(grep -iE -- "$AI_TRAILER" "$tmp.trailers")
 case $? in
 	0) echo 'AI trailer in a commit message (remove the trailer; the report names the commit only):'
 	   printf '%s\n' "$bad" | cut -d: -f1
@@ -177,9 +211,27 @@ changed_files() {   # <commit> <diff-filter> -> paths, one per line
 }
 
 allow=peanuts/scripts/publish-allowlist.txt
-tmp="${TMPDIR:-/tmp}/check-publish.$$"
-trap 'rm -f "$tmp".*' 0 1 2 15
-: > "$tmp.files"; : > "$tmp.gone"; : > "$tmp.hits"; : > "$tmp.seen"; : > "$tmp.ok"; : > "$tmp.entries"; : > "$tmp.stale"
+: > "$tmp.files"; : > "$tmp.gone"; : > "$tmp.hits"; : > "$tmp.seen"; : > "$tmp.ok"; : > "$tmp.entries"
+: > "$tmp.stale"; : > "$tmp.later"
+
+# The exemptions are the ones published at <target-ref>, read from the object store, never the working tree: a
+# local edit to the allowlist must not change the verdict for the same --since/--target pair, and an exemption
+# must be published to count. A tree without the file has no exemptions; an object the gate cannot read is a
+# failure, because "no entries" and "could not look" must never be the same answer.
+allowlist_at() {   # <ref> <output file>: the allowlist as published at that commit
+	# The output goes to the file named here, never through the function's stdout: a die() inside a redirected
+	# function would put its own message in that file and leave the terminal with nothing.
+	if git cat-file -e "$1:$allow" 2>/dev/null; then
+		git cat-file blob "$1:$allow" > "$2" \
+			|| die "cannot read $allow at $1: its object is missing, so the gate cannot check its exemptions"
+		return 0
+	fi
+	found=$(git ls-tree "$1" -- "$allow" 2>&1) \
+		|| die "cannot look up $allow at $1: the gate cannot check its exemptions"
+	[ -z "$found" ] || die "cannot read $allow at $1: the gate cannot check its exemptions"
+	: > "$2"
+}
+allowlist_at "$target" "$tmp.allow" || exit 1
 
 for c in $revs; do
 	changed_files "$c" 'ACMRT' > "$tmp.changed" \
@@ -235,13 +287,14 @@ if [ -f "$allow" ]; then
 		if grep -Fxq -- "$p" "$tmp.files" || grep -Fxq -- "$p" "$tmp.gone"; then
 			printf '%s\n' "$entry" >> "$tmp.ok"
 		fi
-	done < "$allow"
+	done < "$tmp.allow"
 fi
 
 # --- the scan: every changed file, at every commit that changed it ------------------------------
 for c in $revs; do
 	changed_files "$c" 'ACMRT' > "$tmp.changed" \
 		|| die "git diff-tree $c failed: the gate cannot list what that commit changes"
+	allowlist_at "$c" "$tmp.allowc" || exit 1
 	LC_ALL=C sort -u "$tmp.changed" > "$tmp.changed.u" || die "sort failed on $c's changed files"
 	while IFS= read -r f; do
 		[ -n "$f" ] || continue
@@ -274,6 +327,12 @@ for c in $revs; do
 					fail=1
 				else
 					printf '%s\n' "$pair" >> "$tmp.seen"
+					# The entry is published at <target-ref>; was it already there at this commit? If not, it was
+					# added later in the range. That still covers this exact line, but it is reported rather than
+					# silent: an entry that only appears after the line it exempts is a promise made afterwards.
+					if ! grep -Fxq -- "$pair" "$tmp.allowc"; then
+						printf '%s\t%s\t%s\n' "$c" "$f" "$lineno" >> "$tmp.later"
+					fi
 				fi
 			else
 				printf '%s\t%s\t%s\t%s\n' "$c" "$f" "$lineno" "$codes" >> "$tmp.hits"
@@ -289,6 +348,13 @@ if [ -s "$tmp.hits" ]; then
 	while IFS="$tab" read -r c f lineno codes; do
 		printf '%s: %s:%s: %s\n' "$c" "$f" "$lineno" "$codes"
 	done < "$tmp.hits"
+fi
+
+if [ -s "$tmp.later" ]; then
+	echo "exempted by an allowlist entry that is not in the same commit (it was added later in this range; the entry still has to name this exact line at $target):"
+	while IFS="$tab" read -r c f lineno; do
+		printf '  %s: %s:%s\n' "$c" "$f" "$lineno"
+	done < "$tmp.later"
 fi
 
 # Each remaining entry must still describe exactly one line of its file as published at <target-ref>.
