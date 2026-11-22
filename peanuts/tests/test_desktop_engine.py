@@ -650,6 +650,23 @@ class ProcessGroupAndOutput(unittest.TestCase):
                               'the slot came back before Exited was queued: a window could drop the run')
         self.assertIs(run.at_release['last'], run.at_release['exit_event'])
 
+    def test_a_stopped_run_keeps_the_same_event_order(self):
+        # The stop path ends in the same _wait() as a natural exit; the ordering must hold there too, or a window
+        # that pressed Stop could lose the Exited event it is waiting for.
+        run = ReleaseWatcher(child(SLEEPER))
+        run.start()
+        ready = False
+        deadline = time.monotonic() + 15
+        while not ready and time.monotonic() < deadline:
+            ready = any(isinstance(e, Line) and 'ready' in e.text for e in run.drain(timeout=0.2))
+        self.assertTrue(ready, 'the child never started')
+        self.assertTrue(run.stop(grace=5))
+        self.assertTrue(run.wait(15), 'the run did not end after stop()')
+        self.assertIsNotNone(run.at_release, 'the run slot was never released')
+        self.assertIsInstance(run.at_release['last'], Exited,
+                              'the slot came back before Exited was queued on the stop path')
+        self.assertIs(run.at_release['last'], run.exit_event)
+
     # --- B1: the window may not exit over a running check ----------------------------------------
     def test_stop_and_wait_ends_the_group_before_it_reports_settled(self):
         # A child that ignores SIGTERM: stop() alone only asks, and its escalation lives on a thread of a process
